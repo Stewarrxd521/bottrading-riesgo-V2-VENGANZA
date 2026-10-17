@@ -260,6 +260,19 @@ DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-8.0"))
 # desde el dashboard SIEMPRE se respeta.
 FIRST_TRANCHE_SL_FRACTION = float(os.getenv("FIRST_TRANCHE_SL_FRACTION", "0.251"))
 
+# TP fijo por nº de tramos (USD, positivo). Si un nº de tramos no está aquí, su
+# TP es notional × TAKE_PROFIT_FRACTION. Se edita desde la web: {1: 0.8, 3: 2.5}.
+TP_OVERRIDES: Dict[int, float] = {}
+
+# ── Venganza ──────────────────────────────────────────────────────────────────
+# Cuando un short cierra por STOP LOSS se abre un LONG en el mismo símbolo con el
+# notional cerrado × REVENGE_MULT. Su TP = |pérdida del SL| × REVENGE_RECOVER_PCT/100
+# y su SL = SL global. Una venganza que pierde NO abre otra venganza.
+# Todo se cambia en caliente desde la web.
+REVENGE_ENABLED     = os.getenv("REVENGE_ENABLED", "false").lower() == "true"
+REVENGE_MULT        = float(os.getenv("REVENGE_MULT", "1"))
+REVENGE_RECOVER_PCT = float(os.getenv("REVENGE_RECOVER_PCT", "50"))
+
 # ── Executor externo ──────────────────────────────────────────────────────────
 EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
@@ -281,21 +294,57 @@ STATE_TRADES_MAX  = int(os.getenv("STATE_TRADES_MAX", "5000"))
 STATE_BOOT_WAIT_S = float(os.getenv("STATE_BOOT_WAIT_S", "20"))   # espera inicial al estado antes de abrir los WS
 SHUTDOWN_DRAIN_S  = 5.0     # al apagar: espera a que terminen las órdenes en vuelo antes del guardado final
 
-# True si el SL global se cambió desde la web: solo entonces viaja en el estado
-# guardado (si no, manda DEFAULT_STOP_LOSS_USD del entorno).
-DEFAULT_SL_FROM_UI = False
+# Ajustes cambiados desde la web: solo estos viajan en el estado guardado y en
+# SETTINGS_FILE (el resto manda el valor de entorno).
+UI_SETTINGS: Dict[str, Any] = {}
+
+
+def _apply_settings(data: dict) -> None:
+    """Aplica ajustes guardados (los inválidos se ignoran) y los marca como de la web."""
+    global DEFAULT_STOP_LOSS_USD, TAKE_PROFIT_FRACTION, TP_OVERRIDES
+    global REVENGE_ENABLED, REVENGE_MULT, REVENGE_RECOVER_PCT
+    if not isinstance(data, dict):
+        return
+    for key, val in data.items():
+        try:
+            if key == "default_stop_loss_usd":
+                val = float(val)
+                if val >= 0:
+                    continue
+                DEFAULT_STOP_LOSS_USD = val
+            elif key == "take_profit_fraction":
+                val = float(val)
+                if val <= 0:
+                    continue
+                TAKE_PROFIT_FRACTION = val
+            elif key == "tp_overrides":
+                val = {str(int(k)): float(v) for k, v in (val or {}).items() if float(v) > 0}
+                TP_OVERRIDES = {int(k): v for k, v in val.items()}
+            elif key == "revenge_enabled":
+                val = bool(val)
+                REVENGE_ENABLED = val
+            elif key == "revenge_mult":
+                val = float(val)
+                if val <= 0:
+                    continue
+                REVENGE_MULT = val
+            elif key == "revenge_recover_pct":
+                val = float(val)
+                if val <= 0:
+                    continue
+                REVENGE_RECOVER_PCT = val
+            else:
+                continue
+        except (TypeError, ValueError, AttributeError):
+            continue
+        UI_SETTINGS[key] = val
 
 
 def _load_settings() -> None:
-    """Restaura el SL global guardado desde la web (sobrescribe el valor de entorno)."""
-    global DEFAULT_STOP_LOSS_USD, DEFAULT_SL_FROM_UI
+    """Restaura los ajustes guardados desde la web (sobrescriben los de entorno)."""
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        val = float(data.get("default_stop_loss_usd"))
-        if val < 0:
-            DEFAULT_STOP_LOSS_USD = val
-            DEFAULT_SL_FROM_UI = True
+            _apply_settings(json.load(fh))
     except Exception:
         pass
 
@@ -316,6 +365,14 @@ class Fill:
     opened_at:   float = field(default_factory=time.time)
 
 
+def fills_pnl(fills: List[Fill], price: float, side: str = "SHORT") -> float:
+    """PnL de unos fills a `price`: un short gana si baja, un long si sube."""
+    if price <= 0:
+        return 0.0
+    pnl = sum((f.entry_price - price) * f.qty for f in fills)
+    return -pnl if side == "LONG" else pnl
+
+
 @dataclass
 class BotPosition:
     symbol:       str
@@ -327,6 +384,17 @@ class BotPosition:
     sl_usd:       float = DEFAULT_STOP_LOSS_USD
     # True si el SL lo fijó el usuario desde el dashboard: el bot NO lo toca más.
     sl_manual:    bool  = False
+    # "SHORT" (estrategia normal) o "LONG" (venganza).
+    side:         str   = "SHORT"
+    # TP fijado a mano desde el dashboard (USD, positivo): manda sobre todo lo demás.
+    tp_manual:     bool  = False
+    tp_manual_usd: float = 0.0
+    # TP de recuperación de una venganza (USD). Sin TP manual ni venganza, el TP
+    # es el del nº de tramos (TP_OVERRIDES o notional × TAKE_PROFIT_FRACTION).
+    tp_usd:       float = 0.0
+    # Venganza: posición abierta tras el SL del trade `revenge_of`.
+    revenge:      bool  = False
+    revenge_of:   int   = 0
     # ── Excursiones de la operación (PnL no realizado, USD y % del notional) ──
     opened_ts:    float = field(default_factory=time.time)
     mfe_usd:      float = 0.0    # máximo a favor  (>= 0)
@@ -380,17 +448,46 @@ class BotPosition:
         return sum(f.entry_price * f.qty for f in self.fills) / self.qty
 
     def unrealized_pnl(self, mark_price: float) -> float:
-        if mark_price <= 0:
+        return fills_pnl(self.fills, mark_price, self.side)
+
+    # ── Take profit ──────────────────────────────────────────────────────────
+    def target_usd(self) -> float:
+        """TP vigente en USD: manual → tp_manual_usd; venganza → tp_usd; si no, el TP fijo del
+        nº de tramos (TP_OVERRIDES) o notional × TAKE_PROFIT_FRACTION."""
+        if self.tp_manual:
+            return self.tp_manual_usd
+        if self.revenge:
+            return self.tp_usd
+        override = TP_OVERRIDES.get(len(self.fills))
+        if override is not None:
+            return override
+        return self.notional * TAKE_PROFIT_FRACTION
+
+    @property
+    def tp_mode(self) -> str:
+        if self.tp_manual:
+            return "manual"
+        if self.revenge:
+            return "venganza"
+        return "tramo fijo" if len(self.fills) in TP_OVERRIDES else "auto"
+
+    def price_for_pnl(self, pnl_usd: float) -> float:
+        """Precio al que la posición tendría ese PnL (para mostrar TP/SL en precio)."""
+        qty = self.qty
+        if qty <= 0:
             return 0.0
-        return sum((f.entry_price - mark_price) * f.qty for f in self.fills)
+        sign = 1.0 if self.side == "LONG" else -1.0
+        return self.avg_entry + sign * pnl_usd / qty
 
     def opened_levels(self) -> set:
         return {f.level for f in self.fills}
 
     # ── Stop loss automático por tramos ──────────────────────────────────────
     def auto_sl_usd(self) -> float:
-        """1 solo tramo → -(notional del primer fill × 0.251).
+        """Venganza → SL global. 1 solo tramo → -(notional del primer fill × 0.251).
         2 o más tramos → SL estándar (DEFAULT_STOP_LOSS_USD)."""
+        if self.revenge:
+            return DEFAULT_STOP_LOSS_USD
         if len(self.fills) == 1:
             return -abs(self.fills[0].notional) * FIRST_TRANCHE_SL_FRACTION
         return DEFAULT_STOP_LOSS_USD
@@ -404,6 +501,8 @@ class BotPosition:
     def sl_mode(self) -> str:
         if self.sl_manual:
             return "manual"
+        if self.revenge:
+            return "global"
         return "1er tramo" if len(self.fills) == 1 else "estándar"
 
 
@@ -493,7 +592,9 @@ class BinanceFuturesClient:
         norm = round(norm, decs)
         return norm if norm >= info.get("minQty", 0.0) else 0.0
 
-    async def market_short(self, symbol: str, notional: float, price: float) -> float:
+    async def market_open(self, symbol: str, notional: float, price: float,
+                          side: str = "SHORT") -> float:
+        """Abre a mercado: SHORT = SELL, LONG = BUY. Devuelve la qty enviada."""
         min_notional = self.exchange_filters.get(symbol, {}).get("minNotional", 5.0)
         effective    = max(notional, min_notional)
         qty          = self.normalize_qty(symbol, effective / price)
@@ -503,19 +604,27 @@ class BinanceFuturesClient:
             return qty
         # Sin consulta de leverage: se usa el apalancamiento ya configurado en la cuenta.
         await self.request("POST", "/fapi/v1/order",
-            {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": qty},
+            {"symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
+             "type": "MARKET", "quantity": qty},
             signed=True)
         return qty
 
-    async def close_short(self, symbol: str, qty: float) -> None:
+    async def market_close(self, symbol: str, qty: float, side: str = "SHORT") -> None:
+        """Cierra (reduceOnly): un SHORT se cierra con BUY, un LONG con SELL."""
         qty = self.normalize_qty(symbol, qty)
         if qty <= 0 or PAPER_MODE or not LIVE_TRADING:
             return
         # Timeout 10 s: debe completarse antes del timeout de Flask (30 s)
         await self.request("POST", "/fapi/v1/order",
-            {"symbol": symbol, "side": "BUY", "type": "MARKET",
+            {"symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", "type": "MARKET",
              "quantity": qty, "reduceOnly": "true"},
             signed=True, timeout=10)
+
+    async def market_short(self, symbol: str, notional: float, price: float) -> float:
+        return await self.market_open(symbol, notional, price, "SHORT")
+
+    async def close_short(self, symbol: str, qty: float) -> None:
+        await self.market_close(symbol, qty, "SHORT")
 
 
 
@@ -1084,7 +1193,7 @@ class TradingBot:
             if not pos or pos.status != "OPEN" or not pos.fills:
                 return
             pnl    = pos.unrealized_pnl(price)
-            target = pos.notional * TAKE_PROFIT_FRACTION
+            target = pos.target_usd()
             sl_usd = pos.sl_usd
         if pnl <= sl_usd:
             reason = "SL"
@@ -1114,8 +1223,8 @@ class TradingBot:
             if self.symbol_cooldown.get(symbol, 0.0) > now:
                 return
             pos = self.positions.get(symbol)
-            if pos is not None and pos.status != "OPEN":
-                return
+            if pos is not None and (pos.status != "OPEN" or pos.revenge):
+                return                      # a una venganza no se le añaden tramos
             opened = pos.opened_levels() if pos else set()
 
         due = [
@@ -1222,7 +1331,8 @@ class TradingBot:
             if symbol in self._closing_symbols or key in self._entry_reserved:
                 return False
             pos = self.positions.get(symbol)
-            if pos is not None and (level in pos.opened_levels() or pos.status != "OPEN"):
+            if pos is not None and (level in pos.opened_levels() or pos.status != "OPEN"
+                                    or pos.revenge):
                 return False
             trade_id = pos.trade_id if (pos is not None and pos.trade_id) else 0
             self._entry_reserved.add(key)
@@ -1294,8 +1404,11 @@ class TradingBot:
                 avg_ent   = (sum(f.entry_price * f.qty for f in snapshot) / qty) if qty > 0 else 0.0
                 trade_id  = pos.trade_id
                 sl_usd    = pos.sl_usd
-                target    = notional * TAKE_PROFIT_FRACTION
-                pnl       = sum((f.entry_price - price) * f.qty for f in snapshot) if price > 0 else 0.0
+                target    = pos.target_usd()
+                side      = pos.side
+                revenge   = pos.revenge
+                revenge_of = pos.revenge_of
+                pnl       = fills_pnl(snapshot, price, side)
                 # Re-verifica la condición con el estado actual (pudo cambiar el SL desde el dashboard)
                 if reason == "SL" and pnl > sl_usd:
                     return False
@@ -1315,7 +1428,9 @@ class TradingBot:
                 stat_rec = {
                     "trade_id":      trade_id,
                     "symbol":        symbol,
-                    "direction":     "SHORT",
+                    "direction":     side,
+                    "revenge":       revenge,
+                    "revenge_of":    revenge_of,
                     "reason":        reason,
                     "opened_at_ts":  pos.opened_ts,
                     "closed_at_ts":  now_ts,
@@ -1341,7 +1456,7 @@ class TradingBot:
                 }
 
             try:
-                await self.client.close_short(symbol, qty)
+                await self.client.market_close(symbol, qty, side)
             except Exception as exc:
                 self.last_error = str(exc)
                 self._close_backoff[symbol] = time.time() + CLOSE_ERROR_BACKOFF_S
@@ -1351,6 +1466,7 @@ class TradingBot:
 
             unblock_str = ""
             leftover = 0
+            fully_closed = False
             with self.lock:
                 pos = self.positions.get(symbol)
                 if pos:
@@ -1364,6 +1480,7 @@ class TradingBot:
                         pos.reset_excursions()      # la posición restante empieza sus excursiones de cero
                     else:
                         self.positions.pop(symbol, None)
+                        fully_closed     = True
                         pos.status       = "CLOSED"
                         pos.realized_pnl = pnl
                         unblock_ts  = time.time() + COOLDOWN_SECONDS
@@ -1382,6 +1499,10 @@ class TradingBot:
                         "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                         "unblock_at":  unblock_str,
                         "reason":      reason,
+                        "side":        side,
+                        "revenge":     revenge,
+                        "revenge_of":  revenge_of,
+                        "trade_id":    trade_id,
                         **exc,
                     })
                     self.closed_trades = self.closed_trades[:500]
@@ -1392,33 +1513,96 @@ class TradingBot:
             self.executor.notify_close(
                 trade_id=trade_id,
                 symbol=symbol,
-                direction="SHORT",
+                direction=side,
                 reason=reason,
                 close_price=price,
                 pnl=pnl,
             )
+            tag = f"🔁 VENGANZA {side} " if revenge else ""
             if reason == "TP":
                 self.log(
-                    f"CIERRE TP {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
+                    f"{tag}CIERRE TP {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
                     f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
                 )
             elif reason == "SL":
                 self.log(
-                    f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
+                    f"⛔ {tag}STOP LOSS {symbol}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
                     f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
                 )
             else:
                 self.log(
-                    f"✋ CIERRE MANUAL {symbol}: PnL={pnl:.4f} | "
+                    f"✋ {tag}CIERRE MANUAL {symbol}: PnL={pnl:.4f} | "
                     f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
                 )
             if leftover:
                 self.log(f"⚠️ {symbol}: {leftover} tramo(s) se abrieron durante el cierre; "
                          f"la posición sigue abierta con ellos (sin cooldown)")
             self.persist_state()
+            if reason == "SL" and fully_closed and not revenge and REVENGE_ENABLED:
+                # Corre después del finally: el guard de cierre ya estará liberado
+                self._spawn(self._open_revenge(symbol, notional * REVENGE_MULT, pnl, trade_id, price))
             return True
         finally:
             self._end_close_guard(symbol)
+
+    async def _open_revenge(self, symbol: str, notional: float, loss: float,
+                            lost_trade_id: int, close_price: float) -> bool:
+        """Venganza: tras el SL de un short abre un LONG en el mismo símbolo.
+        TP = |pérdida| × REVENGE_RECOVER_PCT/100 · SL = SL global. Ignora el
+        cooldown que acaba de poner el cierre (es justo el símbolo bloqueado)."""
+        tp_usd = abs(loss) * REVENGE_RECOVER_PCT / 100.0
+        if not self.store.can_open():
+            self.log(f"🔁 Venganza {symbol} NO abierta: persistencia del estado no confirmada")
+            return False
+        if tp_usd <= 0 or notional <= 0:
+            return False
+        key = (symbol, "REVENGE")
+        with self.lock:
+            if symbol in self.positions or symbol in self._closing_symbols \
+                    or key in self._entry_reserved:
+                return False
+            self._entry_reserved.add(key)
+        try:
+            price = self._price_for(symbol) or close_price
+            trade_id = self._next_trade_id()
+            try:
+                qty = await self.client.market_open(symbol, notional, price, "LONG")
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"🔁 Error abriendo venganza LONG {symbol}: {exc}")
+                return False
+            fill = Fill(level=0.0, notional=notional, entry_price=price, qty=qty)
+            pos = BotPosition(symbol=symbol, trade_id=trade_id, fills=[fill], side="LONG",
+                              tp_usd=tp_usd, revenge=True, revenge_of=lost_trade_id)
+            pos.refresh_auto_sl()
+            with self.lock:
+                if symbol in self.positions:      # no debería pasar: el short ya salió
+                    self.log(f"🔁 Venganza {symbol} descartada: ya hay otra posición abierta")
+                    return False
+                self.positions[symbol] = pos
+                sl_now = pos.sl_usd
+            self._watch_add(symbol)
+            self.log(
+                f"🔁 VENGANZA LONG {symbol}: {notional:.2f} USDT (×{REVENGE_MULT:g}) | qty={qty} | "
+                f"px={price:.6f} | pérdida a recuperar {loss:.4f} → TP=+{tp_usd:.4f} USD "
+                f"({REVENGE_RECOVER_PCT:g}%) | SL={sl_now:.4f} USD | trade_id={trade_id} "
+                f"(venganza de #{lost_trade_id})"
+            )
+            self.executor.notify_open(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="LONG",
+                price=price,
+                quantity=qty,
+                notional=notional,
+                level=0.0,
+            )
+            self.persist_state()
+            self._enqueue(symbol)
+            return True
+        finally:
+            with self.lock:
+                self._entry_reserved.discard(key)
 
     # ── Estadísticas MFE / MAE ────────────────────────────────────────────────
 
@@ -1484,6 +1668,7 @@ class TradingBot:
             ("TP",     [r for r in recs if r.get("reason") == "TP"]),
             ("SL",     [r for r in recs if r.get("reason") == "SL"]),
             ("MANUAL", [r for r in recs if r.get("reason") == "MANUAL"]),
+            ("REVENGE", [r for r in recs if r.get("revenge")]),
         ):
             groups[name] = {
                 "n":          len(subset),
@@ -1521,9 +1706,7 @@ class TradingBot:
     def set_default_stop_loss(self, sl_usd: float, override_manual: bool = False) -> dict:
         """Cambia el SL estándar (2+ tramos), lo guarda en disco y lo aplica ya a las
         posiciones abiertas. Los SL manuales se respetan salvo override_manual=True."""
-        global DEFAULT_STOP_LOSS_USD, DEFAULT_SL_FROM_UI
-        DEFAULT_STOP_LOSS_USD = float(sl_usd)
-        DEFAULT_SL_FROM_UI = True
+        _apply_settings({"default_stop_loss_usd": float(sl_usd)})
         updated: List[str] = []
         with self.lock:
             for sym, pos in self.positions.items():
@@ -1535,13 +1718,7 @@ class TradingBot:
                 pos.refresh_auto_sl()
                 if pos.sl_usd != before:
                     updated.append(sym)
-        tmp = f"{SETTINGS_FILE}.tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"default_stop_loss_usd": DEFAULT_STOP_LOSS_USD}, fh)
-            os.replace(tmp, SETTINGS_FILE)
-        except Exception as exc:
-            self.log(f"No pude guardar ajustes: {exc}")
+        self._save_settings()
         self.log(f"SL GLOBAL = {DEFAULT_STOP_LOSS_USD:.4f} USD "
                  f"(posiciones actualizadas: {', '.join(updated) or 'ninguna'}"
                  f"{' | manuales sobrescritos' if override_manual else ''})")
@@ -1549,6 +1726,94 @@ class TradingBot:
         for sym in self._open_position_symbols():
             self._enqueue(sym)          # reevalúa ya con el nuevo SL
         return {"default_stop_loss_usd": DEFAULT_STOP_LOSS_USD, "updated": updated}
+
+    def _save_settings(self) -> None:
+        """Guarda en disco los ajustes cambiados desde la web (también viajan en
+        el documento de recuperación)."""
+        tmp = f"{SETTINGS_FILE}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(UI_SETTINGS, fh)
+            os.replace(tmp, SETTINGS_FILE)
+        except Exception as exc:
+            self.log(f"No pude guardar ajustes: {exc}")
+
+    # ── TP global / por tramos y venganza, editables en caliente ─────────────
+
+    def set_tp_settings(self, fraction: Optional[float] = None,
+                        tranche: Optional[int] = None, tranche_tp: Optional[float] = None,
+                        clear_tranche: bool = False) -> dict:
+        """Cambia el multiplicador del TP y/o el TP fijo de un nº de tramos.
+        clear_tranche=True devuelve ese nº de tramos al cálculo automático."""
+        changes = {}
+        if fraction is not None:
+            changes["take_profit_fraction"] = float(fraction)
+        if tranche is not None:
+            overrides = {int(k): v for k, v in TP_OVERRIDES.items()}
+            if clear_tranche:
+                overrides.pop(int(tranche), None)
+            else:
+                overrides[int(tranche)] = float(tranche_tp)
+            changes["tp_overrides"] = overrides
+        _apply_settings(changes)
+        self._save_settings()
+        self.log(f"TP: multiplicador ×{TAKE_PROFIT_FRACTION:g} | fijos por tramos: "
+                 f"{', '.join(f'{k}→{v:g}' for k, v in sorted(TP_OVERRIDES.items())) or 'ninguno'}")
+        self.persist_state()
+        for sym in self._open_position_symbols():
+            self._enqueue(sym)          # reevalúa ya con el nuevo TP
+        return self.tp_config()
+
+    def tp_config(self) -> dict:
+        """TP resultante para cada nº de tramos (notional acumulado de ENTRY_NOTIONALS)."""
+        rows, cum = [], 0.0
+        for i, (lvl, nt) in enumerate(zip(ENTRY_LEVELS, ENTRY_NOTIONALS), start=1):
+            cum += nt
+            auto = cum * TAKE_PROFIT_FRACTION
+            ov = TP_OVERRIDES.get(i)
+            rows.append({"n": i, "level": lvl, "notional": nt, "cum_notional": cum,
+                         "auto": auto, "override": ov, "tp": auto if ov is None else ov})
+        return {"take_profit_fraction": TAKE_PROFIT_FRACTION, "tranches": rows}
+
+    def set_revenge_settings(self, enabled: Optional[bool] = None, mult: Optional[float] = None,
+                             recover_pct: Optional[float] = None) -> dict:
+        changes: Dict[str, Any] = {}
+        if enabled is not None:
+            changes["revenge_enabled"] = bool(enabled)
+        if mult is not None:
+            changes["revenge_mult"] = float(mult)
+        if recover_pct is not None:
+            changes["revenge_recover_pct"] = float(recover_pct)
+        _apply_settings(changes)
+        self._save_settings()
+        self.log(f"🔁 Venganza {'ACTIVADA' if REVENGE_ENABLED else 'desactivada'} | "
+                 f"notional ×{REVENGE_MULT:g} | recupera {REVENGE_RECOVER_PCT:g}% de la pérdida")
+        self.persist_state()
+        return self.revenge_config()
+
+    @staticmethod
+    def revenge_config() -> dict:
+        return {"enabled": REVENGE_ENABLED, "mult": REVENGE_MULT,
+                "recover_pct": REVENGE_RECOVER_PCT}
+
+    def set_take_profit(self, symbol: str, tp_usd: Optional[float]) -> bool:
+        """TP MANUAL (USD, positivo) de una posición abierta; None = volver al automático
+        (en una venganza, al TP de recuperación con el que se abrió)."""
+        symbol = symbol.upper().strip()
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN":
+                return False
+            if tp_usd is None:
+                pos.tp_manual = False
+            else:
+                pos.tp_manual, pos.tp_manual_usd = True, float(tp_usd)
+            target = pos.target_usd()
+        self.log(f"Take profit {'MANUAL' if tp_usd is not None else 'automático'} para "
+                 f"{symbol}: +{target:.4f} USD")
+        self.persist_state()
+        self._enqueue(symbol)
+        return True
 
     def set_stop_loss(self, symbol: str, sl_usd: float) -> bool:
         """Fija un stop loss MANUAL (USD, negativo) para una posición abierta.
@@ -1676,7 +1941,7 @@ class TradingBot:
                     "p":   price,
                     "c":   self._change_for(sym, price),
                     "pnl": pnl,
-                    "sl":  (pos.avg_entry - pos.sl_usd / qty) if qty > 0 else 0.0,
+                    "sl":  pos.price_for_pnl(pos.sl_usd) if qty > 0 else 0.0,
                     "mfe": max(pos.mfe_usd, pnl),
                     "mae": min(pos.mae_usd, pnl),
                 }
@@ -1743,15 +2008,20 @@ class TradingBot:
             pnl   = pos.unrealized_pnl(price)
             total_unreal   += pnl
             total_notional += pos.notional
-            # Short SL: (avg_entry - sl_price) * qty = sl_usd → sl_price = avg_entry - sl_usd/qty
-            sl_price = (pos.avg_entry - pos.sl_usd / pos.qty) if pos.qty > 0 else 0.0
+            sl_price = pos.price_for_pnl(pos.sl_usd)
+            target   = pos.target_usd()
             open_positions.append({
                 "symbol":          symbol,
                 "mark_price":      price,
                 "avg_entry":       pos.avg_entry,
                 "qty":             pos.qty,
                 "notional":        pos.notional,
-                "target":          pos.notional * TAKE_PROFIT_FRACTION,
+                "target":          target,
+                "tp_price":        pos.price_for_pnl(target),
+                "tp_mode":         pos.tp_mode,
+                "side":            pos.side,
+                "revenge":         pos.revenge,
+                "revenge_of":      pos.revenge_of,
                 "unrealized_pnl":  pnl,
                 "stop_loss_price": sl_price,
                 "stop_loss_usd":   pos.sl_usd,
@@ -1814,6 +2084,8 @@ class TradingBot:
             "entry_levels":      ENTRY_LEVELS,
             "entry_notionals":   ENTRY_NOTIONALS,
             "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
+            "tp_config":         self.tp_config(),
+            "revenge":           self.revenge_config(),
             "default_stop_loss_usd":      DEFAULT_STOP_LOSS_USD,
             "first_tranche_sl_fraction":  FIRST_TRANCHE_SL_FRACTION,
             "total_unrealized":   total_unreal,
@@ -1936,8 +2208,10 @@ class TradingBot:
             "price_blocked":         price_blocked,
             "price_block_reset_at":  self._price_block_reset_at,
         }
-        if DEFAULT_SL_FROM_UI:
+        if "default_stop_loss_usd" in UI_SETTINGS:      # formato anterior: lo siguen leyendo
             doc["default_stop_loss_usd"] = DEFAULT_STOP_LOSS_USD
+        if UI_SETTINGS:
+            doc["settings"] = dict(UI_SETTINGS)
         return doc, trades
 
     @staticmethod
@@ -1979,16 +2253,13 @@ class TradingBot:
     def _apply_recovery(self, doc: Optional[dict], trades: List[dict], source: str) -> None:
         """Restaura el estado guardado, reemplazando el de memoria. Llamar antes de
         arrancar WebSockets y motor, o desde el loop del bot si llega más tarde."""
-        global DEFAULT_STOP_LOSS_USD, DEFAULT_SL_FROM_UI
         now = time.time()
         doc = doc or {}
-        try:
-            sl = float(doc.get("default_stop_loss_usd"))   # solo está si se cambió desde la web
-            if sl < 0:
-                DEFAULT_STOP_LOSS_USD = sl       # antes que las posiciones (lo usa refresh_auto_sl)
-                DEFAULT_SL_FROM_UI = True
-        except (TypeError, ValueError):
-            pass
+        # Ajustes de la web, antes que las posiciones (los usa refresh_auto_sl / target_usd).
+        # default_stop_loss_usd suelto es el formato anterior a "settings".
+        if "default_stop_loss_usd" in doc:
+            _apply_settings({"default_stop_loss_usd": doc.get("default_stop_loss_usd")})
+        _apply_settings(doc.get("settings") or {})
 
         positions: Dict[str, BotPosition] = {}
         for sym, d in (doc.get("positions") or {}).items():
@@ -2071,6 +2342,10 @@ class TradingBot:
             "closed_at":   fmt(r.get("closed_at_ts"), "%Y-%m-%d %H:%M:%S UTC"),
             "unblock_at":  fmt(cooldowns[sym], "%Y-%m-%d %H:%M UTC") if sym in cooldowns else "",
             "reason":      r.get("reason", ""),
+            "side":        r.get("direction", "SHORT"),
+            "revenge":     bool(r.get("revenge", False)),
+            "revenge_of":  r.get("revenge_of", 0),
+            "trade_id":    r.get("trade_id", 0),
             "mfe_usd":     r.get("mfe_usd", 0.0),
             "mae_usd":     r.get("mae_usd", 0.0),
             "mfe_pct":     r.get("mfe_pct", 0.0),
@@ -2135,8 +2410,9 @@ class TradingBot:
 # ─────────────────────────────────────────────────────────────────────────────
 
 bot = TradingBot()
-bot.start()
-atexit.register(bot.shutdown)
+if os.getenv("BOT_AUTOSTART", "true").lower() == "true":    # false = solo para tests
+    bot.start()
+    atexit.register(bot.shutdown)
 
 app = Flask(__name__)
 
@@ -2220,11 +2496,45 @@ HTML = r"""<!doctype html>
     .kpi .value { font-size: 24px; font-weight: 800; line-height: 1.15; word-break: break-word; }
     .kpi .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
 
-    /* ── Tarjeta SL global ── */
+    /* ── Tarjetas de ajustes (mismo tamaño que las posiciones) ── */
+    .cfglist { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; align-items: start; }
+    .cfg { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+    .cfg-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .cfg-title { font-weight: 800; font-size: 15px; }
+    .cfg-big { font-size: 22px; font-weight: 800; }
+    .cfg .note { margin: 0; font-size: 11px; }
     .slcard { border-color: rgba(251,146,60,.45); }
-    .slrow { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
-    .slcur { min-width: 120px; }
-    .slcur b { font-size: 26px; color: var(--orange); }
+    .tpcard { border-color: rgba(52,211,153,.4); }
+    .rvcard { border-color: rgba(167,139,250,.45); }
+    .rvcard.on { box-shadow: 0 0 0 1px rgba(167,139,250,.5), 0 0 18px rgba(167,139,250,.18); }
+    .slrow { display: flex; gap: 8px; align-items: center; }
+    .slrow input { padding: 9px 10px; font-size: 15px; }
+    .slrow .btn { min-height: 40px; padding: 9px 14px; }
+    .numbtn { background: none; border: 1px dashed currentColor; border-radius: 8px; font: inherit;
+              font-weight: 800; padding: 1px 7px; cursor: pointer; color: inherit; }
+    .tptable { width: 100%; font-size: 12px; }
+    .tptable th, .tptable td { padding: 4px 6px; }
+    .tptable .numbtn { color: var(--green); font-size: 13px; }
+    .tptable tr.fixed td { background: rgba(52,211,153,.06); }
+    .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+    .seg button { background: #0b1226; color: var(--muted); border: 0; padding: 7px 14px; font-weight: 800;
+                  font-size: 13px; cursor: pointer; }
+    .seg button.on { background: var(--violet); color: #0a0f1e; }
+    .chipbtn { background: #0b1226; color: var(--muted); border: 1px solid var(--line); border-radius: 999px;
+               padding: 4px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
+    .chipbtn.on { color: var(--violet); border-color: var(--violet); }
+    .kv { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 13px; }
+    .kv > span:first-child { color: var(--muted); }
+    .switch { position: relative; width: 46px; height: 26px; flex: 0 0 auto; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch span { position: absolute; inset: 0; background: #2a3658; border-radius: 999px; cursor: pointer; transition: .2s; }
+    .switch span::before { content: ""; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px;
+                           background: #fff; border-radius: 50%; transition: .2s; }
+    .switch input:checked + span { background: var(--violet); }
+    .switch input:checked + span::before { transform: translateX(20px); }
+    .revtag { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--violet);
+              color: var(--violet); font-weight: 800; white-space: nowrap; }
+    tr.rev-row { background: rgba(167,139,250,.07); }
     .field { display: flex; flex-direction: column; gap: 4px; flex: 1 1 160px; }
     .field label { font-size: 12px; color: var(--muted); }
     input[type=number] {
@@ -2262,6 +2572,9 @@ HTML = r"""<!doctype html>
     .pill { padding: 3px 10px; border-radius: 999px; background: #0b1226; border: 1px solid var(--line); font-size: 11px; }
     .slbtn { background: none; border: 1px dashed var(--orange); color: var(--orange); border-radius: 8px;
              font-weight: 800; font-size: 14px; padding: 3px 8px; cursor: pointer; text-align: left; }
+    .tpbtn { border-color: var(--green); color: var(--green); }
+    .tag.tp { border-color: #065f46; color: var(--green); }
+    .pos.rev { border-color: rgba(167,139,250,.55); }
     .tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid #78350f; color: var(--orange); width: fit-content; }
     .pos-actions { display: flex; gap: 8px; }
     .pos-actions .btn { flex: 1; }
@@ -2339,7 +2652,7 @@ HTML = r"""<!doctype html>
   </div>
   <nav>
     <a href="#sec-pos">Posiciones</a>
-    <a href="#sec-sl">SL global</a>
+    <a href="#sec-cfg">Ajustes</a>
     <a href="#sec-radar">Radar</a>
     <a href="#sec-stats">Estadísticas</a>
     <a href="#sec-hist">Historial</a>
@@ -2368,20 +2681,57 @@ HTML = r"""<!doctype html>
     <div id="posList" class="poslist"><div class="empty">Sin posiciones abiertas</div></div>
   </section>
 
-  <!-- SL global -->
-  <section id="sec-sl" class="anchor card slcard">
-    <h2 class="sec">⛔ Stop Loss global <span class="sub">se aplica ya a las posiciones abiertas con 2+ tramos</span></h2>
-    <div class="slrow">
-      <div class="slcur"><div class="label">Valor actual (USD)</div><b id="gslCurrent">—</b></div>
-      <div class="field">
-        <label for="gslInput">Nuevo SL global (negativo, ej. -6)</label>
-        <input id="gslInput" type="number" step="0.1" inputmode="decimal" placeholder="-8">
-      </div>
-      <button id="gslSave" class="btn btn-orange">Aplicar</button>
+  <!-- Ajustes en caliente: SL global, TP por tramos y venganza -->
+  <section id="sec-cfg" class="anchor">
+    <h2 class="sec">⚙️ Ajustes en caliente <span class="sub">se guardan y sobreviven a reinicios</span></h2>
+    <div class="cfglist">
+      <article id="sec-sl" class="card cfg slcard">
+        <div class="cfg-top">
+          <span class="cfg-title">⛔ Stop Loss global</span>
+          <b id="gslCurrent" class="cfg-big" style="color:var(--orange)">—</b>
+        </div>
+        <div class="slrow">
+          <input id="gslInput" type="number" step="0.1" inputmode="decimal" placeholder="-8" aria-label="Nuevo SL global (USD, negativo)">
+          <button id="gslSave" class="btn btn-orange">Aplicar</button>
+        </div>
+        <label class="check" style="margin:0;font-size:12px"><input id="gslOverride" type="checkbox"> Sobrescribir también los SL manuales</label>
+        <div id="gslMsg" class="msg" style="margin:0"></div>
+        <p class="note">Posiciones con 2+ tramos y venganzas. El 1er tramo usa notional×<span id="gslFrac">0.251</span>.</p>
+      </article>
+
+      <article id="sec-tp" class="card cfg tpcard">
+        <div class="cfg-top">
+          <span class="cfg-title">🎯 Take Profit</span>
+          <span class="positive" style="font-size:13px">× <button id="tpFracBtn" class="numbtn" onclick="editTpFraction()">—</button></span>
+        </div>
+        <div class="tablewrap">
+          <table class="tptable">
+            <thead><tr><th>Tramos</th><th>Notional acum.</th><th>TP (USD)</th></tr></thead>
+            <tbody id="tbTpTranches"><tr><td colspan="3" class="muted">—</td></tr></tbody>
+          </table>
+        </div>
+        <p class="note">TP = notional acumulado × multiplicador. Toca un TP para fijarlo a mano en ese nº de tramos.</p>
+      </article>
+
+      <article id="sec-rev" class="card cfg rvcard">
+        <div class="cfg-top">
+          <span class="cfg-title">🔁 Venganza <span id="rvState" class="revtag">OFF</span></span>
+          <label class="switch" title="Activar / desactivar venganza"><input id="rvEnabled" type="checkbox"><span></span></label>
+        </div>
+        <div class="kv"><span>Notional del LONG</span>
+          <span class="seg"><button data-mult="1" onclick="setRevenge({mult:1})">×1</button><button data-mult="2" onclick="setRevenge({mult:2})">×2</button></span></div>
+        <div class="kv"><span>Recuperar de la pérdida</span>
+          <button id="rvPctBtn" class="numbtn violet" onclick="editRevengePct()">—</button></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap" id="rvChips">
+          <button class="chipbtn" data-pct="50" onclick="setRevenge({recover_pct:50})">50%</button>
+          <button class="chipbtn" data-pct="100" onclick="setRevenge({recover_pct:100})">100%</button>
+          <button class="chipbtn" data-pct="120" onclick="setRevenge({recover_pct:120})">120%</button>
+          <button class="chipbtn" data-pct="150" onclick="setRevenge({recover_pct:150})">150%</button>
+        </div>
+        <div id="rvMsg" class="msg" style="margin:0"></div>
+        <p class="note" id="rvNote">Tras un SL abre un LONG en el mismo símbolo.</p>
+      </article>
     </div>
-    <label class="check"><input id="gslOverride" type="checkbox"> También sobrescribir los SL manuales de las posiciones abiertas</label>
-    <div id="gslMsg" class="msg"></div>
-    <p class="note" id="gslNote">El valor se guarda y sobrevive a reinicios. Los SL fijados a mano en una posición se respetan salvo que marques la casilla.</p>
   </section>
 
   <!-- Radar -->
@@ -2495,19 +2845,20 @@ HTML = r"""<!doctype html>
   </details>
 </main>
 
-<!-- Modal: SL individual -->
-<div id="slModalOverlay" class="overlay">
+<!-- Modal: editar un número (SL / TP por posición, TP por tramos, venganza) -->
+<div id="numModalOverlay" class="overlay">
   <div class="card modal">
-    <h3 style="margin:0 0 4px;font-size:16px">Editar Stop Loss</h3>
-    <p class="muted" style="margin:0 0 12px;font-size:13px">Símbolo: <strong id="slModalSymbol" style="color:var(--txt)">—</strong></p>
+    <h3 id="numModalTitle" style="margin:0 0 4px;font-size:16px">Editar</h3>
+    <p id="numModalSub" class="muted" style="margin:0 0 12px;font-size:13px"></p>
     <div class="field">
-      <label for="slModalInput">Pérdida máxima en USD (negativo). Un SL manual se respeta siempre.</label>
-      <input id="slModalInput" type="number" step="0.1" inputmode="decimal">
+      <label id="numModalLabel" for="numModalInput"></label>
+      <input id="numModalInput" type="number" step="0.1" inputmode="decimal">
     </div>
-    <p id="slModalError" class="negative" style="display:none;font-size:12px;margin:8px 0 0"></p>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
-      <button id="slModalCancel" class="btn btn-ghost">Cancelar</button>
-      <button id="slModalSave" class="btn btn-orange">Guardar</button>
+    <p id="numModalError" class="negative" style="display:none;font-size:12px;margin:8px 0 0"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap">
+      <button id="numModalAuto" class="btn btn-ghost" style="display:none">Volver a auto</button>
+      <button id="numModalCancel" class="btn btn-ghost">Cancelar</button>
+      <button id="numModalSave" class="btn btn-orange">Guardar</button>
     </div>
   </div>
 </div>
@@ -2558,8 +2909,9 @@ function tickTimers() {
 }
 setInterval(tickTimers, 1000);
 
-function slStyle(slPx, mrkPx) {
-  const d = (slPx > 0 && mrkPx > 0) ? ((slPx - mrkPx) / mrkPx * 100) : 999;
+function slStyle(slPx, mrkPx, isLong) {
+  // Distancia (%) que le queda al precio para tocar el SL: arriba en un short, abajo en un long
+  const d = (slPx > 0 && mrkPx > 0) ? ((isLong ? mrkPx - slPx : slPx - mrkPx) / mrkPx * 100) : 999;
   return d < 2 ? 'color:var(--red)' : d < 5 ? 'color:var(--orange)' : '';
 }
 
@@ -2578,9 +2930,12 @@ function render(d) {
   const frac = n(d.first_tranche_sl_fraction || 0.251);
   const defSl = n(d.default_stop_loss_usd ?? -8);
   q('slHint').textContent = `1er tramo = notional×${frac} · 2+ tramos = ${fx(defSl, 2)} USD`;
-  setTxt('gslCurrent', fx(defSl, 2) + ' USD');
+  setTxt('gslCurrent', fx(defSl, 2));
+  setTxt('gslFrac', String(frac));
   const gi = q('gslInput');
   if (gi && document.activeElement !== gi && !gi.dataset.dirty) gi.value = defSl;
+  renderTpConfig(d.tp_config);
+  renderRevenge(d.revenge, defSl);
 
   const pu = n(d.total_unrealized);
   q('pnl').textContent = sgn(pu); q('pnl').className = 'value ' + cls(pu);
@@ -2647,20 +3002,24 @@ function render(d) {
   // Posiciones (se reconstruye solo si cambia la estructura)
   _posSyms = new Set(positions.map(p => p.symbol));
   const posSig = JSON.stringify(positions.map(p => [
-    p.symbol, p.avg_entry, p.qty, p.notional, p.target, p.stop_loss_usd, p.sl_mode,
-    (Array.isArray(p.fills) ? p.fills.length : 0)
+    p.symbol, p.avg_entry, p.qty, p.notional, p.target, p.tp_mode, p.stop_loss_usd, p.sl_mode,
+    p.side, (Array.isArray(p.fills) ? p.fills.length : 0)
   ]));
   if (posSig !== _posSig) {
     _posSig = posSig;
     q('posList').innerHTML = positions.length ? positions.map(p => {
       const sym = p.symbol, pnl = n(p.unrealized_pnl);
       const slPx = n(p.stop_loss_price), mrkPx = n(p.mark_price), slUsd = n(p.stop_loss_usd);
-      const fills = (Array.isArray(p.fills) ? p.fills : [])
-        .map(f => `<span class="pill">+${fx(f.level,0)}% · ${fx(f.notional,2)}</span>`).join('');
-      return `<article class="card pos" id="prow_${sym}">
+      const isLong = p.side === 'LONG';
+      const fills = p.revenge
+        ? `<span class="pill" style="color:var(--violet)">🔁 venganza de #${p.revenge_of} · ${fx(p.notional,2)}</span>`
+        : (Array.isArray(p.fills) ? p.fills : [])
+            .map(f => `<span class="pill">+${fx(f.level,0)}% · ${fx(f.notional,2)}</span>`).join('');
+      return `<article class="card pos${p.revenge ? ' rev' : ''}" id="prow_${sym}">
         <div class="pos-top">
           <div>
             <a class="sym" href="https://www.binance.com/en/futures/${sym}" target="_blank" rel="noopener">${sym}</a>
+            ${p.revenge ? '<span class="revtag">🔁 VENGANZA LONG</span>' : `<span class="tag" style="color:var(--muted);border-color:var(--line)">${isLong ? 'LONG' : 'SHORT'}</span>`}
             <span id="pc_${sym}" class="chg ${cls(p.change)}">${pct(p.change)}</span>
           </div>
           <div id="ppnl_${sym}" class="pnl ${cls(pnl)}">${sgn(pnl)}</div>
@@ -2669,11 +3028,15 @@ function render(d) {
           <div><span>Entrada media</span><b>${px(p.avg_entry)}</b></div>
           <div><span>Precio en vivo</span><b id="pp_${sym}">${px(p.mark_price)}</b></div>
           <div><span>Notional</span><b>${fx(p.notional, 2)} USDT</b></div>
-          <div><span>Objetivo TP</span><b class="positive">+${fx(p.target, 3)}</b></div>
-          <div id="pslc_${sym}" style="${slStyle(slPx, mrkPx)}"><span>SL (precio)</span><b id="psl_${sym}">${px(slPx)}</b></div>
+          <div><span>Tramos</span><b>${p.revenge ? '—' : (Array.isArray(p.fills) ? p.fills.length : 0)}</b></div>
+          <div><span>TP (USD)</span>
+            <button class="slbtn tpbtn" onclick="editTakeProfit('${sym}', ${n(p.target)}, ${p.tp_mode === 'manual'})">+${usd(p.target)}</button>
+            <span class="tag tp">${p.tp_mode || ''}</span></div>
           <div><span>SL (USD)</span>
             <button class="slbtn" onclick="editStopLoss('${sym}', ${slUsd})">${usd(slUsd)}</button>
             <span class="tag">${p.sl_mode || ''}</span></div>
+          <div><span>TP (precio)</span><b class="positive">${px(p.tp_price)}</b></div>
+          <div id="pslc_${sym}" style="${slStyle(slPx, mrkPx, isLong)}"><span>SL (precio)</span><b id="psl_${sym}">${px(slPx)}</b></div>
           <div><span>MFE (máx. a favor)</span><b id="pmfe_${sym}" class="positive">${sgn(p.mfe_usd)}</b></div>
           <div><span>MAE (máx. en contra)</span><b id="pmae_${sym}" class="negative">${sgn(p.mae_usd)}</b></div>
         </div>
@@ -2720,8 +3083,9 @@ function render(d) {
     : r === 'SL' ? '<span class="r-sl">⛔ SL</span>'
     : r === 'MANUAL' ? '<span class="r-manual">✋ Manual</span>'
     : `<span class="muted">${r || '—'}</span>`;
-  q('tbClosed').innerHTML = closed.length ? closed.map(t => `<tr>
-      <td data-label="Símbolo" style="font-weight:800">${t.symbol || ''}</td>
+  q('tbClosed').innerHTML = closed.length ? closed.map(t => `<tr class="${t.revenge ? 'rev-row' : ''}">
+      <td data-label="Símbolo" style="font-weight:800">${t.symbol || ''}
+        ${t.revenge ? `<span class="revtag" title="Venganza del trade #${t.revenge_of || '?'}">🔁 VENGANZA ${t.side || 'LONG'}</span>` : ''}</td>
       <td data-label="Motivo">${reasonLabel(t.reason)}</td>
       <td data-label="PnL" class="${cls(t.pnl)}" style="font-weight:700">${sgn(t.pnl)}</td>
       <td data-label="MFE" class="positive">${t.mfe_usd === undefined ? '—' : sgn(t.mfe_usd)}</td>
@@ -2752,7 +3116,7 @@ function applyLive(d) {
     if (pn) { setTxt('ppnl_' + sym, sgn(p.pnl)); pn.className = 'pnl ' + cls(p.pnl); }
     setTxt('psl_' + sym, px(p.sl));
     const slc = q('pslc_' + sym);
-    if (slc) slc.style.cssText = slStyle(n(p.sl), n(p.p));
+    if (slc) slc.style.cssText = slStyle(n(p.sl), n(p.p), !!q('prow_' + sym).classList.contains('rev'));
     setTxt('pmfe_' + sym, sgn(p.mfe));
     setTxt('pmae_' + sym, sgn(p.mae));
   }
@@ -2798,8 +3162,8 @@ function renderStats(s) {
   setTxt('stMfe', all && all.n ? '+' + fx(all.mfe_usd.median, 3) : '—');
   setTxt('stMae', all && all.n ? '−' + fx(all.mae_usd.median, 3) : '—');
 
-  const names = { ALL: 'Todas', TP: '✅ TP', SL: '⛔ SL', MANUAL: '✋ Manual' };
-  const rows = ['ALL', 'TP', 'SL', 'MANUAL'].filter(k => (s.groups || {})[k] && s.groups[k].n)
+  const names = { ALL: 'Todas', TP: '✅ TP', SL: '⛔ SL', MANUAL: '✋ Manual', REVENGE: '🔁 Venganza' };
+  const rows = ['ALL', 'TP', 'SL', 'MANUAL', 'REVENGE'].filter(k => (s.groups || {})[k] && s.groups[k].n)
     .map(k => { const g = s.groups[k]; return `<tr>
       <td style="font-weight:700">${names[k]}</td><td>${g.n}</td>
       <td class="positive">${fx(g.mfe_usd.median, 3)}</td><td class="positive">${fx(g.mfe_usd.p90, 3)}</td>
@@ -2855,52 +3219,176 @@ async function saveGlobalSl() {
   }
 }
 
-// ── Modal SL por posición ───────────────────────────────────────────────────
-let _slModalSymbol = null;
-function editStopLoss(symbol, currentSl) {
-  _slModalSymbol = symbol;
-  q('slModalSymbol').textContent = symbol;
-  q('slModalInput').value = currentSl;
-  q('slModalError').style.display = 'none';
-  q('slModalOverlay').style.display = 'flex';
-  setTimeout(() => q('slModalInput').focus(), 50);
+// ── Modal genérico para editar un número ────────────────────────────────────
+let _num = null;
+function openNum(opts) {
+  _num = opts;
+  setTxt('numModalTitle', opts.title);
+  q('numModalSub').innerHTML = opts.sub || '';
+  setTxt('numModalLabel', opts.label);
+  const inp = q('numModalInput');
+  inp.step = opts.step || '0.1';
+  inp.value = opts.value;
+  q('numModalAuto').style.display = opts.auto ? '' : 'none';
+  q('numModalError').style.display = 'none';
+  q('numModalOverlay').style.display = 'flex';
+  setTimeout(() => { inp.focus(); inp.select(); }, 50);
 }
-function closeSlModal() { q('slModalOverlay').style.display = 'none'; _slModalSymbol = null; }
+function closeNum() { q('numModalOverlay').style.display = 'none'; _num = null; }
+function numError(msg) { q('numModalError').textContent = msg; q('numModalError').style.display = 'block'; }
 
-async function saveSlModal() {
-  const symbol = _slModalSymbol;
-  if (!symbol) return;
-  const slUsd = parseFloat(String(q('slModalInput').value).replace(',', '.'));
-  if (isNaN(slUsd) || slUsd >= 0) {
-    q('slModalError').textContent = 'El Stop Loss debe ser un número negativo (por ejemplo -5).';
-    q('slModalError').style.display = 'block'; return;
+async function saveNum(useAuto) {
+  const o = _num;
+  if (!o) return;
+  let v = null;
+  if (!useAuto) {
+    v = parseFloat(String(q('numModalInput').value).replace(',', '.'));
+    const err = isNaN(v) ? 'Escribe un número.' : (o.validate ? o.validate(v) : null);
+    if (err) { numError(err); return; }
   }
-  const saveBtn = q('slModalSave');
+  const saveBtn = q('numModalSave');
   saveBtn.disabled = true; saveBtn.textContent = '…';
   try {
-    const resp = await fetch(`/api/set-sl/${symbol}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sl_usd: slUsd }), cache: 'no-store',
+    const resp = await fetch(o.url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+      body: JSON.stringify(o.body(v)),
     });
     const data = await resp.json();
-    if (data.ok) { closeSlModal(); requestFull(true); }
-    else { q('slModalError').textContent = data.error || `Error HTTP ${resp.status}`; q('slModalError').style.display = 'block'; }
+    if (data.ok) { closeNum(); requestFull(true); }
+    else numError(data.error || `Error HTTP ${resp.status}`);
   } catch (err) {
-    q('slModalError').textContent = `Error de red: ${err.message}`; q('slModalError').style.display = 'block';
+    numError(`Error de red: ${err.message}`);
   } finally { saveBtn.disabled = false; saveBtn.textContent = 'Guardar'; }
 }
 
+function editStopLoss(symbol, currentSl) {
+  openNum({
+    title: 'Editar Stop Loss', sub: `Símbolo: <strong style="color:var(--txt)">${symbol}</strong>`,
+    label: 'Pérdida máxima en USD (negativo). Un SL manual se respeta siempre.', value: currentSl,
+    validate: v => v >= 0 ? 'El Stop Loss debe ser un número negativo (por ejemplo -5).' : null,
+    url: `/api/set-sl/${symbol}`, body: v => ({ sl_usd: v }),
+  });
+}
+
+function editTakeProfit(symbol, currentTp, isManual) {
+  openNum({
+    title: 'Editar Take Profit', sub: `Símbolo: <strong style="color:var(--txt)">${symbol}</strong>`,
+    label: 'Ganancia objetivo en USD (positivo). Un TP manual se respeta siempre.', value: fx(currentTp, 4),
+    auto: isManual,
+    validate: v => v <= 0 ? 'El Take Profit debe ser un número positivo (por ejemplo 1.5).' : null,
+    url: `/api/set-tp/${symbol}`, body: v => v === null ? { auto: true } : { tp_usd: v },
+  });
+}
+
+// ── TP: multiplicador y TP por nº de tramos ─────────────────────────────────
+let _tpCfg = null;
+function renderTpConfig(cfg) {
+  if (!cfg) return;
+  _tpCfg = cfg;
+  setTxt('tpFracBtn', String(n(cfg.take_profit_fraction)));
+  const rows = Array.isArray(cfg.tranches) ? cfg.tranches : [];
+  const sig = JSON.stringify(rows.map(r => [r.n, r.tp, r.override]));
+  const body = q('tbTpTranches');
+  if (body.dataset.sig === sig) return;
+  body.dataset.sig = sig;
+  body.innerHTML = rows.map(r => {
+    const fixed = r.override !== null && r.override !== undefined;
+    return `<tr class="${fixed ? 'fixed' : ''}">
+      <td>${r.n} <span class="muted">(+${fx(r.level, 0)}%)</span></td>
+      <td>${fx(r.cum_notional, 2)}</td>
+      <td><button class="numbtn" onclick="editTrancheTp(${r.n})">+${fx(r.tp, 3)}</button>${fixed ? ' <span class="tag tp">fijo</span>' : ''}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="3" class="muted">—</td></tr>';
+}
+
+function editTpFraction() {
+  const cur = _tpCfg ? n(_tpCfg.take_profit_fraction) : 0.14284;
+  openNum({
+    title: 'Multiplicador del Take Profit',
+    sub: 'TP = notional acumulado × multiplicador (ej. 0.14284 = 14.28%)',
+    label: 'Multiplicador (positivo)', value: cur, step: '0.001',
+    validate: v => v <= 0 ? 'Debe ser un número positivo.' : null,
+    url: '/api/set-tp-config', body: v => ({ fraction: v }),
+  });
+}
+
+function editTrancheTp(nTr) {
+  const r = (_tpCfg && _tpCfg.tranches || []).find(x => x.n === nTr);
+  if (!r) return;
+  const fixed = r.override !== null && r.override !== undefined;
+  openNum({
+    title: `TP con ${nTr} tramo(s)`,
+    sub: `Notional acumulado ${fx(r.cum_notional, 2)} USDT · automático = +${fx(r.auto, 4)}`,
+    label: 'Ganancia objetivo en USD (positivo)', value: fx(r.tp, 4), auto: fixed,
+    validate: v => v <= 0 ? 'El Take Profit debe ser un número positivo.' : null,
+    url: '/api/set-tp-config',
+    body: v => v === null ? { tranche: nTr, auto: true } : { tranche: nTr, tp_usd: v },
+  });
+}
+
+// ── Venganza ────────────────────────────────────────────────────────────────
+let _rv = null;
+function renderRevenge(rv, defSl) {
+  if (!rv) return;
+  _rv = rv;
+  const on = !!rv.enabled, mult = n(rv.mult), rec = n(rv.recover_pct);
+  const sw = q('rvEnabled');
+  if (sw && !sw.dataset.busy) sw.checked = on;
+  q('sec-rev').classList.toggle('on', on);
+  setTxt('rvState', on ? 'ON' : 'OFF');
+  q('rvState').style.opacity = on ? '1' : '.55';
+  document.querySelectorAll('#sec-rev .seg button').forEach(b => b.classList.toggle('on', n(b.dataset.mult) === mult));
+  document.querySelectorAll('#rvChips .chipbtn').forEach(b => b.classList.toggle('on', n(b.dataset.pct) === rec));
+  setTxt('rvPctBtn', `${fx(rec, rec % 1 ? 1 : 0)}%`);
+  const ex = Math.abs(n(defSl));
+  setTxt('rvNote', `Tras un SL abre un LONG con el notional cerrado ×${mult}. ` +
+    `TP = ${fx(rec, 0)}% de la pérdida (SL de -${fx(ex, 2)} → TP +${fx(ex * rec / 100, 2)}). ` +
+    `SL = SL global. Si la venganza pierde, no se encadena otra.`);
+}
+
+async function setRevenge(body) {
+  const msg = q('rvMsg');
+  msg.className = 'msg'; msg.textContent = '…';
+  try {
+    const resp = await fetch('/api/set-revenge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (data.ok) { msg.textContent = ''; renderRevenge(data, n(q('gslCurrent').textContent) || -8); requestFull(true); }
+    else { msg.className = 'msg negative'; msg.textContent = data.error || `Error HTTP ${resp.status}`; }
+  } catch (err) {
+    msg.className = 'msg negative'; msg.textContent = 'Error de red: ' + err.message;
+  }
+}
+
+function editRevengePct() {
+  openNum({
+    title: 'Venganza: % a recuperar',
+    sub: '50 = la mitad de la pérdida del SL · 100 = toda · 120 = un poco más',
+    label: 'Porcentaje de la pérdida que busca el TP de la venganza', value: _rv ? n(_rv.recover_pct) : 50, step: '1',
+    validate: v => v <= 0 ? 'Debe ser un porcentaje positivo.' : null,
+    url: '/api/set-revenge', body: v => ({ recover_pct: v }),
+  });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
-  q('slModalCancel').addEventListener('click', closeSlModal);
-  q('slModalSave').addEventListener('click', saveSlModal);
-  q('slModalOverlay').addEventListener('click', e => { if (e.target.id === 'slModalOverlay') closeSlModal(); });
-  q('slModalInput').addEventListener('keydown', e => {
-    if (e.key === 'Enter') saveSlModal();
-    if (e.key === 'Escape') closeSlModal();
+  q('numModalCancel').addEventListener('click', closeNum);
+  q('numModalSave').addEventListener('click', () => saveNum(false));
+  q('numModalAuto').addEventListener('click', () => saveNum(true));
+  q('numModalOverlay').addEventListener('click', e => { if (e.target.id === 'numModalOverlay') closeNum(); });
+  q('numModalInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') saveNum(false);
+    if (e.key === 'Escape') closeNum();
   });
   q('gslSave').addEventListener('click', saveGlobalSl);
   q('gslInput').addEventListener('input', () => { q('gslInput').dataset.dirty = '1'; });
   q('gslInput').addEventListener('keydown', e => { if (e.key === 'Enter') saveGlobalSl(); });
+  q('rvEnabled').addEventListener('change', async e => {
+    e.target.dataset.busy = '1';
+    await setRevenge({ enabled: e.target.checked });
+    delete e.target.dataset.busy;
+  });
 });
 
 // ── Cierre manual ───────────────────────────────────────────────────────────
@@ -3064,6 +3552,81 @@ def api_set_sl(symbol: str):
     return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o cerrada"}), 404
 
 
+@app.post("/api/set-tp/<symbol>")
+def api_set_tp(symbol: str):
+    """TP manual (USD, positivo) de una posición abierta. {"auto": true} lo devuelve al automático."""
+    symbol = symbol.upper().strip()
+    data = request.get_json(silent=True) or {}
+    tp_usd: Optional[float] = None
+    if not data.get("auto"):
+        try:
+            tp_usd = float(data.get("tp_usd"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "tp_usd inválido"}), 400
+        if not 0 < tp_usd <= 100000:
+            return jsonify({"ok": False, "error": "tp_usd debe ser un valor positivo (ganancia)"}), 400
+    busy = _not_owner_response()
+    if busy:
+        return busy
+    if bot.set_take_profit(symbol, tp_usd):
+        return jsonify({"ok": True, "symbol": symbol, "tp_usd": tp_usd})
+    return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o cerrada"}), 404
+
+
+@app.post("/api/set-tp-config")
+def api_set_tp_config():
+    """Multiplicador del TP ({"fraction": 0.14}) y/o TP fijo de un nº de tramos
+    ({"tranche": 3, "tp_usd": 2.5}; {"tranche": 3, "auto": true} lo quita)."""
+    data = request.get_json(silent=True) or {}
+    fraction = tranche = tranche_tp = None
+    clear = bool(data.get("auto"))
+    try:
+        if data.get("fraction") is not None:
+            fraction = float(data["fraction"])
+            if not 0 < fraction <= 10:
+                return jsonify({"ok": False, "error": "El multiplicador debe estar entre 0 y 10"}), 400
+        if data.get("tranche") is not None:
+            tranche = int(data["tranche"])
+            if not 1 <= tranche <= len(ENTRY_LEVELS):
+                return jsonify({"ok": False, "error": "Tramo fuera de rango"}), 400
+            if not clear:
+                tranche_tp = float(data.get("tp_usd"))
+                if not 0 < tranche_tp <= 100000:
+                    return jsonify({"ok": False, "error": "El TP debe ser un valor positivo"}), 400
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Valor inválido"}), 400
+    if fraction is None and tranche is None:
+        return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
+    busy = _not_owner_response()
+    if busy:
+        return busy
+    return jsonify({"ok": True, **bot.set_tp_settings(fraction, tranche, tranche_tp, clear)})
+
+
+@app.post("/api/set-revenge")
+def api_set_revenge():
+    """Venganza en caliente: {"enabled": bool, "mult": 1|2, "recover_pct": 50}."""
+    data = request.get_json(silent=True) or {}
+    enabled = mult = recover = None
+    try:
+        if data.get("enabled") is not None:
+            enabled = bool(data["enabled"])
+        if data.get("mult") is not None:
+            mult = float(data["mult"])
+            if not 0 < mult <= 10:
+                return jsonify({"ok": False, "error": "El multiplicador debe estar entre 0 y 10"}), 400
+        if data.get("recover_pct") is not None:
+            recover = float(data["recover_pct"])
+            if not 0 < recover <= 1000:
+                return jsonify({"ok": False, "error": "El % a recuperar debe estar entre 0 y 1000"}), 400
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Valor inválido"}), 400
+    busy = _not_owner_response()
+    if busy:
+        return busy
+    return jsonify({"ok": True, **bot.set_revenge_settings(enabled, mult, recover)})
+
+
 @app.post("/api/force-close/<symbol>")
 def api_force_close(symbol: str):
     """Cierre de EMERGENCIA: ignora el guard anti-doble-cierre y libera el
@@ -3125,7 +3688,7 @@ def api_trades():
 def api_trades_csv():
     """Descarga CSV de todo el histórico (para analizarlo en Excel / pandas)."""
     cols = [
-        "trade_id", "symbol", "direction", "reason", "opened_at_ts", "closed_at_ts",
+        "trade_id", "symbol", "direction", "revenge", "revenge_of", "reason", "opened_at_ts", "closed_at_ts",
         "duration_s", "avg_entry", "close_price", "qty", "notional", "fills_n", "levels",
         "sl_usd", "target", "pnl", "pnl_pct", "mfe_usd", "mae_usd", "mfe_pct", "mae_pct",
         "time_to_mfe_s", "time_to_mae_s", "low_price", "high_price",
