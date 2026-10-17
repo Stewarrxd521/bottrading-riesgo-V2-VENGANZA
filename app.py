@@ -267,11 +267,12 @@ TP_OVERRIDES: Dict[int, float] = {}
 # ── Venganza ──────────────────────────────────────────────────────────────────
 # Cuando un short cierra por STOP LOSS se abre un LONG en el mismo símbolo con el
 # notional cerrado × REVENGE_MULT. Su TP = |pérdida del SL| × REVENGE_RECOVER_PCT/100
-# y su SL = SL global. Una venganza que pierde NO abre otra venganza.
+# y su SL = REVENGE_SL_USD (propio, no el global). Una venganza que pierde NO abre otra.
 # Todo se cambia en caliente desde la web.
 REVENGE_ENABLED     = os.getenv("REVENGE_ENABLED", "false").lower() == "true"
 REVENGE_MULT        = float(os.getenv("REVENGE_MULT", "1"))
 REVENGE_RECOVER_PCT = float(os.getenv("REVENGE_RECOVER_PCT", "50"))
+REVENGE_SL_USD      = float(os.getenv("REVENGE_SL_USD", "-4"))
 
 # ── Executor externo ──────────────────────────────────────────────────────────
 EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
@@ -302,7 +303,7 @@ UI_SETTINGS: Dict[str, Any] = {}
 def _apply_settings(data: dict) -> None:
     """Aplica ajustes guardados (los inválidos se ignoran) y los marca como de la web."""
     global DEFAULT_STOP_LOSS_USD, TAKE_PROFIT_FRACTION, TP_OVERRIDES
-    global REVENGE_ENABLED, REVENGE_MULT, REVENGE_RECOVER_PCT
+    global REVENGE_ENABLED, REVENGE_MULT, REVENGE_RECOVER_PCT, REVENGE_SL_USD
     if not isinstance(data, dict):
         return
     for key, val in data.items():
@@ -333,6 +334,11 @@ def _apply_settings(data: dict) -> None:
                 if val <= 0:
                     continue
                 REVENGE_RECOVER_PCT = val
+            elif key == "revenge_sl_usd":
+                val = float(val)
+                if val >= 0:
+                    continue
+                REVENGE_SL_USD = val
             else:
                 continue
         except (TypeError, ValueError, AttributeError):
@@ -484,10 +490,10 @@ class BotPosition:
 
     # ── Stop loss automático por tramos ──────────────────────────────────────
     def auto_sl_usd(self) -> float:
-        """Venganza → SL global. 1 solo tramo → -(notional del primer fill × 0.251).
+        """Venganza → REVENGE_SL_USD. 1 solo tramo → -(notional del primer fill × 0.251).
         2 o más tramos → SL estándar (DEFAULT_STOP_LOSS_USD)."""
         if self.revenge:
-            return DEFAULT_STOP_LOSS_USD
+            return REVENGE_SL_USD
         if len(self.fills) == 1:
             return -abs(self.fills[0].notional) * FIRST_TRANCHE_SL_FRACTION
         return DEFAULT_STOP_LOSS_USD
@@ -502,7 +508,7 @@ class BotPosition:
         if self.sl_manual:
             return "manual"
         if self.revenge:
-            return "global"
+            return "venganza"
         return "1er tramo" if len(self.fills) == 1 else "estándar"
 
 
@@ -1548,7 +1554,7 @@ class TradingBot:
     async def _open_revenge(self, symbol: str, notional: float, loss: float,
                             lost_trade_id: int, close_price: float) -> bool:
         """Venganza: tras el SL de un short abre un LONG en el mismo símbolo.
-        TP = |pérdida| × REVENGE_RECOVER_PCT/100 · SL = SL global. Ignora el
+        TP = |pérdida| × REVENGE_RECOVER_PCT/100 · SL = REVENGE_SL_USD. Ignora el
         cooldown que acaba de poner el cierre (es justo el símbolo bloqueado)."""
         tp_usd = abs(loss) * REVENGE_RECOVER_PCT / 100.0
         if not self.store.can_open():
@@ -1776,7 +1782,8 @@ class TradingBot:
         return {"take_profit_fraction": TAKE_PROFIT_FRACTION, "tranches": rows}
 
     def set_revenge_settings(self, enabled: Optional[bool] = None, mult: Optional[float] = None,
-                             recover_pct: Optional[float] = None) -> dict:
+                             recover_pct: Optional[float] = None,
+                             sl_usd: Optional[float] = None) -> dict:
         changes: Dict[str, Any] = {}
         if enabled is not None:
             changes["revenge_enabled"] = bool(enabled)
@@ -1784,17 +1791,27 @@ class TradingBot:
             changes["revenge_mult"] = float(mult)
         if recover_pct is not None:
             changes["revenge_recover_pct"] = float(recover_pct)
+        if sl_usd is not None:
+            changes["revenge_sl_usd"] = float(sl_usd)
         _apply_settings(changes)
+        if sl_usd is not None:
+            with self.lock:                 # aplica ya a las venganzas abiertas (salvo SL manual)
+                for pos in self.positions.values():
+                    if pos.revenge and pos.status == "OPEN":
+                        pos.refresh_auto_sl()
         self._save_settings()
         self.log(f"🔁 Venganza {'ACTIVADA' if REVENGE_ENABLED else 'desactivada'} | "
-                 f"notional ×{REVENGE_MULT:g} | recupera {REVENGE_RECOVER_PCT:g}% de la pérdida")
+                 f"notional ×{REVENGE_MULT:g} | recupera {REVENGE_RECOVER_PCT:g}% de la pérdida | "
+                 f"SL {REVENGE_SL_USD:g} USD")
         self.persist_state()
+        for sym in self._open_position_symbols():
+            self._enqueue(sym)              # reevalúa ya con el nuevo SL
         return self.revenge_config()
 
     @staticmethod
     def revenge_config() -> dict:
         return {"enabled": REVENGE_ENABLED, "mult": REVENGE_MULT,
-                "recover_pct": REVENGE_RECOVER_PCT}
+                "recover_pct": REVENGE_RECOVER_PCT, "sl_usd": REVENGE_SL_USD}
 
     def set_take_profit(self, symbol: str, tp_usd: Optional[float]) -> bool:
         """TP MANUAL (USD, positivo) de una posición abierta; None = volver al automático
@@ -2696,7 +2713,7 @@ HTML = r"""<!doctype html>
         </div>
         <label class="check" style="margin:0;font-size:12px"><input id="gslOverride" type="checkbox"> Sobrescribir también los SL manuales</label>
         <div id="gslMsg" class="msg" style="margin:0"></div>
-        <p class="note">Posiciones con 2+ tramos y venganzas. El 1er tramo usa notional×<span id="gslFrac">0.251</span>.</p>
+        <p class="note">Posiciones con 2+ tramos. El 1er tramo usa notional×<span id="gslFrac">0.251</span>; la venganza tiene su propio SL.</p>
       </article>
 
       <article id="sec-tp" class="card cfg tpcard">
@@ -2722,6 +2739,8 @@ HTML = r"""<!doctype html>
           <span class="seg"><button data-mult="1" onclick="setRevenge({mult:1})">×1</button><button data-mult="2" onclick="setRevenge({mult:2})">×2</button></span></div>
         <div class="kv"><span>Recuperar de la pérdida</span>
           <button id="rvPctBtn" class="numbtn violet" onclick="editRevengePct()">—</button></div>
+        <div class="kv"><span>Stop loss de la venganza (USD)</span>
+          <button id="rvSlBtn" class="numbtn" style="color:var(--orange)" onclick="editRevengeSl()">—</button></div>
         <div style="display:flex;gap:6px;flex-wrap:wrap" id="rvChips">
           <button class="chipbtn" data-pct="50" onclick="setRevenge({recover_pct:50})">50%</button>
           <button class="chipbtn" data-pct="100" onclick="setRevenge({recover_pct:100})">100%</button>
@@ -3340,10 +3359,11 @@ function renderRevenge(rv, defSl) {
   document.querySelectorAll('#sec-rev .seg button').forEach(b => b.classList.toggle('on', n(b.dataset.mult) === mult));
   document.querySelectorAll('#rvChips .chipbtn').forEach(b => b.classList.toggle('on', n(b.dataset.pct) === rec));
   setTxt('rvPctBtn', `${fx(rec, rec % 1 ? 1 : 0)}%`);
+  setTxt('rvSlBtn', fx(rv.sl_usd, 2));
   const ex = Math.abs(n(defSl));
   setTxt('rvNote', `Tras un SL abre un LONG con el notional cerrado ×${mult}. ` +
     `TP = ${fx(rec, 0)}% de la pérdida (SL de -${fx(ex, 2)} → TP +${fx(ex * rec / 100, 2)}). ` +
-    `SL = SL global. Si la venganza pierde, no se encadena otra.`);
+    `Su SL es ${fx(rv.sl_usd, 2)} USD. Si la venganza pierde, no se encadena otra.`);
 }
 
 async function setRevenge(body) {
@@ -3360,6 +3380,16 @@ async function setRevenge(body) {
   } catch (err) {
     msg.className = 'msg negative'; msg.textContent = 'Error de red: ' + err.message;
   }
+}
+
+function editRevengeSl() {
+  openNum({
+    title: 'Venganza: Stop Loss',
+    sub: 'Pérdida máxima del LONG de venganza. Se aplica ya a las venganzas abiertas (salvo SL manual).',
+    label: 'Pérdida máxima en USD (negativo, ej. -4)', value: _rv ? n(_rv.sl_usd) : -4,
+    validate: v => v >= 0 ? 'El Stop Loss debe ser un número negativo (por ejemplo -4).' : null,
+    url: '/api/set-revenge', body: v => ({ sl_usd: v }),
+  });
 }
 
 function editRevengePct() {
@@ -3605,9 +3635,9 @@ def api_set_tp_config():
 
 @app.post("/api/set-revenge")
 def api_set_revenge():
-    """Venganza en caliente: {"enabled": bool, "mult": 1|2, "recover_pct": 50}."""
+    """Venganza en caliente: {"enabled": bool, "mult": 1|2, "recover_pct": 50, "sl_usd": -4}."""
     data = request.get_json(silent=True) or {}
-    enabled = mult = recover = None
+    enabled = mult = recover = sl_usd = None
     try:
         if data.get("enabled") is not None:
             enabled = bool(data["enabled"])
@@ -3619,12 +3649,16 @@ def api_set_revenge():
             recover = float(data["recover_pct"])
             if not 0 < recover <= 1000:
                 return jsonify({"ok": False, "error": "El % a recuperar debe estar entre 0 y 1000"}), 400
+        if data.get("sl_usd") is not None:
+            sl_usd = float(data["sl_usd"])
+            if not -100000 <= sl_usd < 0:
+                return jsonify({"ok": False, "error": "El SL de la venganza debe ser negativo (pérdida)"}), 400
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "Valor inválido"}), 400
     busy = _not_owner_response()
     if busy:
         return busy
-    return jsonify({"ok": True, **bot.set_revenge_settings(enabled, mult, recover)})
+    return jsonify({"ok": True, **bot.set_revenge_settings(enabled, mult, recover, sl_usd)})
 
 
 @app.post("/api/force-close/<symbol>")

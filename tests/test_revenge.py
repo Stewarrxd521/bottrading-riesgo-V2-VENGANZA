@@ -30,6 +30,7 @@ def _settings(monkeypatch):
     monkeypatch.setattr(app, "REVENGE_ENABLED", True)
     monkeypatch.setattr(app, "REVENGE_MULT", 2.0)
     monkeypatch.setattr(app, "REVENGE_RECOVER_PCT", 50.0)
+    monkeypatch.setattr(app, "REVENGE_SL_USD", -4.0)
     monkeypatch.setattr(app, "UI_SETTINGS", {})
 
 
@@ -61,8 +62,8 @@ def test_sl_opens_revenge_long():
     assert rev.side == "LONG" and rev.revenge and rev.revenge_of == 7
     assert rev.notional == pytest.approx(10.0)            # 5 × 2
     assert rev.target_usd() == pytest.approx(0.75)        # 50% de 1.5
-    assert rev.sl_usd == -8.0                             # SL global
-    assert rev.sl_mode == "global" and rev.tp_mode == "venganza"
+    assert rev.sl_usd == -4.0                             # SL propio de la venganza
+    assert rev.sl_mode == "venganza" and rev.tp_mode == "venganza"
     assert bot.closed_trades[0]["revenge"] is False
 
 
@@ -80,6 +81,16 @@ def test_revenge_tp_closes_and_is_marked_in_history():
     assert row["revenge"] is True and row["side"] == "LONG" and row["reason"] == "TP"
     assert row["pnl"] == pytest.approx(0.8, rel=1e-6)
     assert bot.trade_stats[-1]["direction"] == "LONG" and bot.trade_stats[-1]["revenge"]
+
+
+def test_revenge_sl_is_editable_and_applies_to_open_revenge():
+    bot = _bot()
+    _short(bot)
+    asyncio.run(_close(bot, 1.3, "SL"))
+    bot.set_default_stop_loss(-20.0)
+    assert bot.positions[SYM].sl_usd == -4.0              # el SL global no la toca
+    bot.set_revenge_settings(sl_usd=-2.5)
+    assert bot.positions[SYM].sl_usd == -2.5
 
 
 def test_losing_revenge_does_not_chain():
@@ -161,9 +172,10 @@ def test_settings_survive_recovery_doc():
 def test_api_routes():
     app.bot.store.writes_enabled = True
     c = app.app.test_client()
-    r = c.post("/api/set-revenge", json={"enabled": True, "mult": 2, "recover_pct": 120})
-    assert r.get_json() == {"ok": True, "enabled": True, "mult": 2.0, "recover_pct": 120.0}
+    r = c.post("/api/set-revenge", json={"enabled": True, "mult": 2, "recover_pct": 120, "sl_usd": -3})
+    assert r.get_json() == {"ok": True, "enabled": True, "mult": 2.0, "recover_pct": 120.0, "sl_usd": -3.0}
     assert c.post("/api/set-revenge", json={"recover_pct": -5}).status_code == 400
+    assert c.post("/api/set-revenge", json={"sl_usd": 2}).status_code == 400
     assert c.post("/api/set-tp-config", json={"tranche": 1, "tp_usd": 0.9}).get_json()["ok"]
     assert c.post("/api/set-tp-config", json={"tranche": 99, "tp_usd": 1}).status_code == 400
     app.bot.positions[SYM] = app.BotPosition(symbol=SYM, fills=[
