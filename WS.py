@@ -98,11 +98,11 @@ _BINANCE_MAX_STREAMS = 1024
 
 # Stream de mercado completo (mark price). Con "@1s" refresca cada
 # segundo pero manda ~90 KB por mensaje (todos los símbolos); sin sufijo
-# refresca cada 3 s. Es sólo la RED DE SEGURIDAD para un símbolo que aún
+# refresca cada 3 s (por defecto: un tercio del tráfico). Es sólo la RED DE SEGURIDAD para un símbolo que aún
 # no tiene su propio bookTicker suscrito — la frescura real de verdad la
 # da <symbol>@bookTicker (tiempo real, ver más abajo).
 _ALL_MARKET_ENABLED  = os.environ.get("WS_ALL_MARKET", "true").lower() == "true"
-_ALL_MARKET_INTERVAL = os.environ.get("WS_ALL_MARKET_INTERVAL", "1s").lower()
+_ALL_MARKET_INTERVAL = os.environ.get("WS_ALL_MARKET_INTERVAL", "3s").lower()
 _ALL_MARKET_STREAM   = "!markPrice@arr@1s" if _ALL_MARKET_INTERVAL == "1s" else "!markPrice@arr"
 
 # Stream de ticker 24h de TODOS los símbolos en un único slot, en vez de

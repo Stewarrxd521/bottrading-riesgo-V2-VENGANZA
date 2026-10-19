@@ -86,3 +86,11 @@ def test_float32_halves_memory():
     b = KlineRing("1m", history=1500, dtype="float32", capacity=819)
     assert b.ohlcv.nbytes * 2 == a.ohlcv.nbytes
     assert a.ohlcv.dtype == np.float64
+
+
+def test_drop_symbols_unassigns_and_allows_readd():
+    s = KlineWebSocketStream(["AAAUSDT", "BBBUSDT"], intervals=["1m"])
+    s.drop_symbols(["aaausdt"])
+    assert [c.symbols for c in s._conns] == [["BBBUSDT"]]
+    assert s._assign(["AAAUSDT"])                      # vuelve a entrar al radar
+    assert sorted(s._conns[0].symbols) == ["AAAUSDT", "BBBUSDT"]

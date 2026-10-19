@@ -189,3 +189,34 @@ def test_api_routes():
     assert snap["revenge"]["recover_pct"] == 120.0
     assert snap["positions"][0]["tp_mode"] == "tramo fijo"
     app.bot.positions.clear()
+
+
+def test_status_is_gzipped_for_browsers():
+    import gzip, json
+    c = app.app.test_client()
+    r = c.get("/api/status", headers={"Accept-Encoding": "gzip, deflate, br"})
+    assert r.headers.get("Content-Encoding") == "gzip"
+    body = gzip.decompress(r.get_data())
+    assert "positions" in json.loads(body)
+    assert c.get("/api/status").headers.get("Content-Encoding") is None
+
+
+def test_prune_drops_kline_streams_of_symbols_leaving_radar():
+    class _T:
+        def __init__(self, pct): self.change_pct = pct
+
+    class _PC:
+        ticker_cache = {"HOTUSDT": _T(40.0), "COLDUSDT": _T(1.0), SYM: _T(1.0)}
+        def update_symbols(self, syms): self.syms = syms
+
+    class _KC:
+        dropped = []
+        def drop_symbols(self, syms): self.dropped.extend(syms)
+
+    bot = _bot()
+    _short(bot)                                            # SYM tiene posición: no se da de baja
+    bot.price_cache, bot.kline_cache = _PC(), _KC()
+    bot.watch = frozenset({"HOTUSDT", "COLDUSDT", SYM})
+    bot._prune_watch()
+    assert bot.kline_cache.dropped == ["COLDUSDT"]
+    assert bot.watch == {"HOTUSDT", SYM}
