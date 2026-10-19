@@ -240,8 +240,10 @@ CLOSE_ERROR_BACKOFF_S  = float(os.getenv("CLOSE_ERROR_BACKOFF_S",  "3"))    # pa
 STATE_PERSIST_SECS     = float(os.getenv("STATE_PERSIST_SECS",     "10"))   # guardado periódico del estado
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
-LIVE_POLL_MS   = int(os.getenv("LIVE_POLL_MS",   "250"))    # el navegador pide precios cada 250 ms (payload mínimo)
-STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "1500"))   # estructura completa de las tablas
+# Cada consulta del navegador es ancho de banda de salida en Render: con la
+# pestaña abierta, 250 ms costaban ~17 MB/h solo en precios.
+LIVE_POLL_MS   = int(os.getenv("LIVE_POLL_MS",   "2000"))   # precios en la web cada 2 s (payload mínimo)
+STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "4000"))   # estructura completa de las tablas
 
 # ── Resto de parámetros operativos ────────────────────────────────────────────
 COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
@@ -2940,7 +2942,7 @@ function fmtDur(secs) {
 let pollCount = 0, livePollCount = 0, _cdData = {}, _lastFetch = 0, _prevScan = 0;
 let _entryLevels = [50], _posSyms = new Set(), _winSyms = new Set();
 let _posSig = '', _winSig = '', _persisted = false;
-let livePollMs = 250, statusPollMs = 1500;
+let livePollMs = 2000, statusPollMs = 4000;
 
 function tickTimers() {
   const elapsed = (Date.now() - _lastFetch) / 1000;
@@ -3486,7 +3488,7 @@ async function livePoll() {
 }
 
 // ── Bucle 2: estructura completa ────────────────────────────────────────────
-let statusTimer = null, statusDelay = 1500, statusFailing = false, statusInFlight = false, _lastFull = 0;
+let statusTimer = null, statusDelay = 4000, statusFailing = false, statusInFlight = false, _lastFull = 0;
 async function pollStatus() {
   if (statusInFlight) return;
   statusInFlight = true; _lastFull = Date.now();

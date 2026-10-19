@@ -49,6 +49,8 @@ services:
       # ── Velas solo por WebSocket (una conexión por intervalo) ───────────────
       - key: KLINE_INTERVALS
         value: "1m"           # ej. "1m,5m,15m": cada intervalo = 1 conexión (radar y posiciones)
+      - key: WS_RADAR_STREAM
+        value: "markPrice@1s"  # "bookTicker" = precio en tiempo real (más tráfico)
       - key: KLINE_ALL_SYMBOLS
         value: "false"        # "true" = velas de TODOS los símbolos (decenas de MB/hora de ancho de banda)
       - key: KLINE_HISTORY

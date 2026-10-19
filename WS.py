@@ -110,6 +110,13 @@ _ALL_MARKET_STREAM   = "!markPrice@arr@1s" if _ALL_MARKET_INTERVAL == "1s" else 
 # símbolo). Mismo flag que el de arriba: son las dos redes "globales".
 _ALL_TICKER_STREAM   = "!ticker@arr"
 
+# Stream de precio de cada símbolo del radar / con posición:
+#   "markPrice@1s" (por defecto) → 1 mensaje/s por símbolo, como el bot anterior.
+#   "bookTicker"                 → mejor bid/ask en tiempo real: más fresco, pero
+#     un símbolo volátil manda decenas de mensajes/s, y cada mensaje pequeño
+#     genera acuses TCP que Render cobra como ancho de banda de salida.
+_RADAR_STREAM = os.environ.get("WS_RADAR_STREAM", "markPrice@1s").strip() or "markPrice@1s"
+
 _WS_BASE_URL = os.environ.get("WS_FSTREAM_URL", "wss://fstream.binance.com/market/stream")
 
 # Mientras el bookTicker de un símbolo esté más fresco que esto, el mark
@@ -236,8 +243,9 @@ class SymbolWebSocketPriceCache:
         # en el instante en que cambia el mejor bid/ask, sin intervalo
         # mínimo). Es lo que da los "ms" de frescura que markPrice@1s o
         # ticker NUNCA pueden dar, porque esos sí tienen un intervalo
-        # mínimo fijo de 1 s en el propio servidor de Binance.
-        return [f"{symbol.lower()}@bookTicker"]
+        # mínimo fijo de 1 s en el propio servidor de Binance. Por defecto
+        # se usa markPrice@1s (menos tráfico); ver _RADAR_STREAM.
+        return [f"{symbol.lower()}@{_RADAR_STREAM}"]
 
     def _desired_streams(self) -> set[str]:
         with self.lock:
