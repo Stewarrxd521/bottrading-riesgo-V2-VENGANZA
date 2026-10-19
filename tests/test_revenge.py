@@ -220,3 +220,9 @@ def test_prune_drops_kline_streams_of_symbols_leaving_radar():
     bot._prune_watch()
     assert bot.kline_cache.dropped == ["COLDUSDT"]
     assert bot.watch == {"HOTUSDT", SYM}
+
+
+def test_gzip_respects_q0():
+    c = app.app.test_client()
+    r = c.get("/api/status", headers={"Accept-Encoding": "gzip;q=0, br"})
+    assert r.headers.get("Content-Encoding") is None

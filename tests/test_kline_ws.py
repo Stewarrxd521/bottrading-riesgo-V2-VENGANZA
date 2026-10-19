@@ -94,3 +94,22 @@ def test_drop_symbols_unassigns_and_allows_readd():
     assert [c.symbols for c in s._conns] == [["BBBUSDT"]]
     assert s._assign(["AAAUSDT"])                      # vuelve a entrar al radar
     assert sorted(s._conns[0].symbols) == ["AAAUSDT", "BBBUSDT"]
+
+
+def test_concurrent_subscribes_are_batched():
+    import asyncio
+
+    class _WS:
+        def __init__(self): self.sent = []
+        async def send(self, m): self.sent.append(json.loads(m))
+
+    async def run():
+        s = KlineWebSocketStream([], intervals=["1m"])
+        conn = s._assign(["AAAUSDT"])[0]
+        ws = _WS(); conn.ws = ws
+        s._assign(["BBBUSDT", "CCCUSDT"])            # entran en el mismo tick
+        await asyncio.gather(*(s._subscribe(conn, ws) for _ in range(3)))
+        return ws.sent
+
+    sent = asyncio.run(run())
+    assert len(sent) == 1 and len(sent[0]["params"]) == 3

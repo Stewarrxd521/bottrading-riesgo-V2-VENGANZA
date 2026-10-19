@@ -259,7 +259,7 @@ class KlineRing:
 
 
 class _Conn:
-    __slots__ = ("cid", "interval", "symbols", "subscribed", "ws", "messages", "reconnects")
+    __slots__ = ("cid", "interval", "symbols", "subscribed", "ws", "messages", "reconnects", "sub_lock")
 
     def __init__(self, cid: int, interval: str) -> None:
         self.cid        = cid
@@ -269,6 +269,7 @@ class _Conn:
         self.ws         = None
         self.messages   = 0
         self.reconnects = 0
+        self.sub_lock: Optional[asyncio.Lock] = None   # se crea en el loop de las velas
 
 
 class KlineWebSocketStream:
@@ -321,18 +322,29 @@ class KlineWebSocketStream:
 
     # ── Conexiones ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _sub_lock(conn: _Conn) -> asyncio.Lock:
+        if conn.sub_lock is None:
+            conn.sub_lock = asyncio.Lock()
+        return conn.sub_lock
+
     async def _subscribe(self, conn: _Conn, ws) -> None:
-        with self._lock:
-            todo = [f"{s.lower()}@kline_{conn.interval}" for s in conn.symbols]
-        todo = [s for s in todo if s not in conn.subscribed]
-        for i in range(0, len(todo), SUB_CHUNK_SIZE):
-            if conn.ws is not ws:
-                return
-            part = todo[i:i + SUB_CHUNK_SIZE]
-            await ws.send(json.dumps({"method": "SUBSCRIBE", "params": part,
-                                      "id": conn.cid * 100_000 + i}))
-            conn.subscribed.update(part)
-            await asyncio.sleep(SUB_CHUNK_GAP_S)
+        # Un solo envío a la vez por conexión: varios símbolos que entran al radar
+        # en el mismo tick acaban en UN mensaje (el primero que entra calcula lo
+        # pendiente; los demás ya no tienen nada que mandar) y nunca se superan
+        # los 10 mensajes/s con los que Binance corta la conexión.
+        async with self._sub_lock(conn):
+            with self._lock:
+                todo = [f"{s.lower()}@kline_{conn.interval}" for s in conn.symbols]
+            todo = [s for s in todo if s not in conn.subscribed]
+            for i in range(0, len(todo), SUB_CHUNK_SIZE):
+                if conn.ws is not ws:
+                    return
+                part = todo[i:i + SUB_CHUNK_SIZE]
+                await ws.send(json.dumps({"method": "SUBSCRIBE", "params": part,
+                                          "id": conn.cid * 100_000 + i}))
+                conn.subscribed.update(part)
+                await asyncio.sleep(SUB_CHUNK_GAP_S)
 
     async def _conn_loop(self, conn: _Conn) -> None:
         await asyncio.sleep(conn.cid * CONN_STAGGER_S)
@@ -434,14 +446,18 @@ class KlineWebSocketStream:
             # si está reconectando, al conectar solo se suscribe a los símbolos que quedan
 
     async def _unsubscribe(self, conn: _Conn, ws, streams: List[str]) -> None:
-        for i in range(0, len(streams), SUB_CHUNK_SIZE):
-            if conn.ws is not ws:
-                return
-            part = streams[i:i + SUB_CHUNK_SIZE]
-            await ws.send(json.dumps({"method": "UNSUBSCRIBE", "params": part,
-                                      "id": conn.cid * 100_000 + 50_000 + i}))
-            conn.subscribed.difference_update(part)
-            await asyncio.sleep(SUB_CHUNK_GAP_S)
+        async with self._sub_lock(conn):
+            with self._lock:
+                still = {f"{s.lower()}@kline_{conn.interval}" for s in conn.symbols}
+            streams = [st for st in streams if st in conn.subscribed and st not in still]
+            for i in range(0, len(streams), SUB_CHUNK_SIZE):
+                if conn.ws is not ws:
+                    return
+                part = streams[i:i + SUB_CHUNK_SIZE]
+                await ws.send(json.dumps({"method": "UNSUBSCRIBE", "params": part,
+                                          "id": conn.cid * 100_000 + 50_000 + i}))
+                conn.subscribed.difference_update(part)
+                await asyncio.sleep(SUB_CHUNK_GAP_S)
 
     def start(self) -> None:
         if self.running:

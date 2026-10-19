@@ -2451,7 +2451,7 @@ def _gzip_json(resp):
     """Comprime las respuestas JSON grandes (/api/status, /api/trades…): Render
     cobra como ancho de banda de salida todo lo que se manda al navegador."""
     if (resp.status_code != 200 or resp.direct_passthrough or resp.mimetype != "application/json"
-            or "gzip" not in request.headers.get("Accept-Encoding", "").lower()
+            or request.accept_encodings.quality("gzip") <= 0
             or "Content-Encoding" in resp.headers):
         return resp
     data = resp.get_data()
