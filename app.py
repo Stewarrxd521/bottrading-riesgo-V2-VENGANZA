@@ -27,6 +27,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import WS as _WS                                              # noqa: E402
 from WS import SymbolWebSocketPriceCache, _ALL_MARKET_ENABLED  # noqa: E402
 from kline_ws import KlineWebSocketStream                     # noqa: E402
 from state_store import StateStore, backend_from_env, make_owner_id  # noqa: E402
@@ -892,8 +893,9 @@ class TradingBot:
         self.watch = frozenset(initial)
         self.price_cache.start()
         self.log(
-            f"PriceCache permanente iniciado: !ticker@arr + !markPrice@arr (todos los símbolos) "
-            f"+ bookTicker ms para el radar (≥{MIN_GAIN_FILTER:.0f}% o posición abierta)"
+            f"PriceCache iniciado: !ticker@arr + !markPrice@arr (todos los símbolos"
+            f"{f', {_WS._SCAN_WINDOW_S:g}s cada {_WS._SCAN_SECS:g}s' if _WS._PERIODIC_SCAN else ''}) "
+            f"+ {_WS._RADAR_STREAM} para el radar (≥{MIN_GAIN_FILTER:.0f}% o posición abierta)"
         )
 
     def _start_kline_cache(self, symbols: List[str]) -> None:

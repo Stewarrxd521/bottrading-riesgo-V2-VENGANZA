@@ -111,11 +111,21 @@ _ALL_MARKET_STREAM   = "!markPrice@arr@1s" if _ALL_MARKET_INTERVAL == "1s" else 
 _ALL_TICKER_STREAM   = "!ticker@arr"
 
 # Stream de precio de cada símbolo del radar / con posición:
-#   "markPrice@1s" (por defecto) → 1 mensaje/s por símbolo, como el bot anterior.
-#   "bookTicker"                 → mejor bid/ask en tiempo real: más fresco, pero
-#     un símbolo volátil manda decenas de mensajes/s, y cada mensaje pequeño
-#     genera acuses TCP que Render cobra como ancho de banda de salida.
-_RADAR_STREAM = os.environ.get("WS_RADAR_STREAM", "markPrice@1s").strip() or "markPrice@1s"
+#   "bookTicker" (por defecto) → mejor bid/ask en tiempo real (TP/SL al instante).
+#   "markPrice@1s"             → 1 mensaje/s por símbolo: menos tráfico.
+_RADAR_STREAM = os.environ.get("WS_RADAR_STREAM", "bookTicker").strip() or "bookTicker"
+
+# Búsqueda periódica (como el bot anterior): los streams de TODO el mercado
+# (!ticker@arr y !markPrice@arr) solo se abren WS_TICKER_SCAN_WINDOW_S segundos
+# cada WS_TICKER_SCAN_SECS; ahí se detectan los símbolos que entran al radar.
+# Fuera de esa ventana solo llegan los streams de los símbolos seguidos (radar
+# y posiciones): bookTicker + <symbol>@ticker (cambio 24h) + <symbol>@markPrice@1s
+# (respaldo si el libro está quieto). Mantener abiertos los de todo el mercado
+# cuesta varios MB/hora de ancho de banda de salida en Render.
+# 0 = los streams de todo el mercado siempre abiertos (detección al instante).
+_SCAN_SECS     = float(os.environ.get("WS_TICKER_SCAN_SECS", "300"))
+_SCAN_WINDOW_S = float(os.environ.get("WS_TICKER_SCAN_WINDOW_S", "10"))
+_PERIODIC_SCAN = _ALL_MARKET_ENABLED and _SCAN_SECS > 0
 
 _WS_BASE_URL = os.environ.get("WS_FSTREAM_URL", "wss://fstream.binance.com/market/stream")
 
@@ -212,6 +222,9 @@ class SymbolWebSocketPriceCache:
         # Socket único y estado de suscripción
         self._ws = None
         self._ws_ready = threading.Event()
+        self._scan_active = False                # ventana de búsqueda (streams de todo el mercado)
+        self.scans = 0
+        self.last_scan_at = 0.0
         self._subscribed: set[str] = set()   # nombres de stream ya suscritos
         self._req_id = 0
 
@@ -229,7 +242,7 @@ class SymbolWebSocketPriceCache:
         # (markPrice@arr + ticker@arr). Antes eran 2 streams POR símbolo
         # (markPrice@1s + ticker), así que este cambio también DUPLICA
         # cuántos símbolos caben por debajo del límite de Binance.
-        needed = len(symbols) * 1 + (2 if _ALL_MARKET_ENABLED else 0)
+        needed = len(symbols) * (3 if _PERIODIC_SCAN else 1) + (2 if _ALL_MARKET_ENABLED else 0)
         if needed > _BINANCE_MAX_STREAMS:
             raise ValueError(
                 f"Binance permite máximo {_BINANCE_MAX_STREAMS} streams por conexión. "
@@ -243,15 +256,20 @@ class SymbolWebSocketPriceCache:
         # en el instante en que cambia el mejor bid/ask, sin intervalo
         # mínimo). Es lo que da los "ms" de frescura que markPrice@1s o
         # ticker NUNCA pueden dar, porque esos sí tienen un intervalo
-        # mínimo fijo de 1 s en el propio servidor de Binance. Por defecto
-        # se usa markPrice@1s (menos tráfico); ver _RADAR_STREAM.
-        return [f"{symbol.lower()}@{_RADAR_STREAM}"]
+        # mínimo fijo de 1 s en el propio servidor de Binance. Con la
+        # búsqueda periódica, el cambio 24h y el mark price de los símbolos
+        # seguidos llegan por sus propios streams (los globales están cerrados).
+        sym = symbol.lower()
+        streams = [f"{sym}@{_RADAR_STREAM}"]
+        if _PERIODIC_SCAN:
+            streams += [f"{sym}@ticker", f"{sym}@markPrice@1s"]
+        return streams
 
     def _desired_streams(self) -> set[str]:
         with self.lock:
             symbols_snapshot = list(self.symbols)
         wanted: set[str] = set()
-        if _ALL_MARKET_ENABLED:
+        if _ALL_MARKET_ENABLED and (not _PERIODIC_SCAN or self._scan_active):
             wanted.add(_ALL_MARKET_STREAM)
             wanted.add(_ALL_TICKER_STREAM)
         for sym in symbols_snapshot:
@@ -509,6 +527,24 @@ class SymbolWebSocketPriceCache:
             finally:
                 self._ws_ready.clear()
                 self._ws = None
+
+    async def _scan_loop(self):
+        """Abre los streams de todo el mercado durante _SCAN_WINDOW_S cada
+        _SCAN_SECS (la primera vez, en cuanto conecta)."""
+        while self.running:
+            await asyncio.to_thread(self._ws_ready.wait, 30)
+            if not self.running:
+                break
+            if self._ws is None:
+                continue
+            self._scan_active = True
+            self.scans += 1
+            self.last_scan_at = time.time()
+            await self._sync_subscriptions()
+            await asyncio.sleep(_SCAN_WINDOW_S)
+            self._scan_active = False
+            await self._sync_subscriptions()
+            await asyncio.sleep(max(1.0, _SCAN_SECS - _SCAN_WINDOW_S))
 
     # ──────────────────────────────────────────────────────────────────────
     # Monitor de salud
@@ -792,11 +828,14 @@ class SymbolWebSocketPriceCache:
 
         submit(self._stream_loop())
         submit(self._monitor_health())
+        if _PERIODIC_SCAN:
+            submit(self._scan_loop())
 
         print(
             f"✅ WebSocket cache iniciado — {len(self.symbols)} símbolo(s) seguidos vía "
-            f"bookTicker (tiempo real), 1 conexión"
+            f"{_RADAR_STREAM}, 1 conexión"
             f"{', + ' + _ALL_MARKET_STREAM + ' + ' + _ALL_TICKER_STREAM if _ALL_MARKET_ENABLED else ''}"
+            f"{f' (búsqueda de {_SCAN_WINDOW_S:g}s cada {_SCAN_SECS:g}s)' if _PERIODIC_SCAN else ''}"
         )
 
     def stop(self):
