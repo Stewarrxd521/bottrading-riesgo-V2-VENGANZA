@@ -3,6 +3,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import csv
+import gzip
 import hashlib
 import io
 import hmac
@@ -26,6 +27,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import WS as _WS                                              # noqa: E402
 from WS import SymbolWebSocketPriceCache, _ALL_MARKET_ENABLED  # noqa: E402
 from kline_ws import KlineWebSocketStream                     # noqa: E402
 from state_store import StateStore, backend_from_env, make_owner_id  # noqa: E402
@@ -216,8 +218,8 @@ PRICE_MAX_AGE_S        = float(os.getenv("PRICE_MAX_AGE_S",        "5"))    # un
 # true = el % de cambio se recalcula en cada tick con (precio / open24h - 1),
 # en vez de esperar al ticker 24h (que llega cada ~1 s).
 USE_LIVE_CHANGE        = os.getenv("USE_LIVE_CHANGE", "true").lower() == "true"
-# Velas SOLO por WebSocket (kline_ws.py) para TODOS los símbolos, sin REST:
-# una conexión por intervalo. "1m" siempre se incluye (confirmación de entrada).
+# Velas SOLO por WebSocket (kline_ws.py), sin REST: una conexión por intervalo.
+# "1m" siempre se incluye (confirmación de entrada).
 KLINE_INTERVALS        = list(dict.fromkeys(
     ["1m"] + [x.strip() for x in os.getenv("KLINE_INTERVALS", "1m").split(",") if x.strip()]
 ))
@@ -225,6 +227,12 @@ KLINE_INTERVALS        = list(dict.fromkeys(
 KLINE_HISTORY          = int(os.getenv("KLINE_HISTORY", "2"))
 # float64 = precisión exacta (48 bytes/vela); float32 = mitad de RAM (28 bytes/vela).
 KLINE_DTYPE            = os.getenv("KLINE_DTYPE", "float32")
+# false (por defecto) = velas solo de los símbolos del radar y con posición: se
+# suscriben al entrar al radar (≥ MIN_GAIN_FILTER) y se dan de baja al salir.
+# true = velas de TODOS los perpetuos: Binance manda ~3.300 mensajes/s por
+# intervalo y solo recibirlos genera decenas de MB/hora de tráfico saliente
+# (acuses TCP), que Render cobra como "Service-Initiated".
+KLINE_ALL_SYMBOLS      = os.getenv("KLINE_ALL_SYMBOLS", "false").lower() == "true"
 # false = sin vela cerrada reciente (primer minuto tras arrancar o reconexión)
 # NO se abre la entrada; true = se permite (comportamiento anterior).
 KLINE_ALLOW_NO_DATA    = os.getenv("KLINE_ALLOW_NO_DATA", "false").lower() == "true"
@@ -233,8 +241,10 @@ CLOSE_ERROR_BACKOFF_S  = float(os.getenv("CLOSE_ERROR_BACKOFF_S",  "3"))    # pa
 STATE_PERSIST_SECS     = float(os.getenv("STATE_PERSIST_SECS",     "10"))   # guardado periódico del estado
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
-LIVE_POLL_MS   = int(os.getenv("LIVE_POLL_MS",   "250"))    # el navegador pide precios cada 250 ms (payload mínimo)
-STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "1500"))   # estructura completa de las tablas
+# Cada consulta del navegador es ancho de banda de salida en Render: con la
+# pestaña abierta, 250 ms costaban ~17 MB/h solo en precios.
+LIVE_POLL_MS   = int(os.getenv("LIVE_POLL_MS",   "2000"))   # precios en la web cada 2 s (payload mínimo)
+STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "4000"))   # estructura completa de las tablas
 
 # ── Resto de parámetros operativos ────────────────────────────────────────────
 COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
@@ -835,8 +845,9 @@ class TradingBot:
 
         # UNA sola conexión WS permanente; el callback despierta al motor en cada tick
         self._start_price_cache()
-        # Velas 1m de TODOS los símbolos por WebSocket (sin REST, sin reinicios)
-        self._start_kline_cache(self.all_symbols)
+        # Velas 1m por WebSocket (sin REST): radar + posiciones, o todos con KLINE_ALL_SYMBOLS
+        self._start_kline_cache(self.all_symbols if KLINE_ALL_SYMBOLS
+                                else sorted(set(self.watch) | set(self._open_position_symbols())))
 
         tasks = [
             asyncio.create_task(self._supervised(self._engine_loop,             "_engine_loop")),
@@ -882,20 +893,22 @@ class TradingBot:
         self.watch = frozenset(initial)
         self.price_cache.start()
         self.log(
-            f"PriceCache permanente iniciado: !ticker@arr + !markPrice@arr (todos los símbolos) "
-            f"+ bookTicker ms para el radar (≥{MIN_GAIN_FILTER:.0f}% o posición abierta)"
+            f"PriceCache iniciado: !ticker@arr + !markPrice@arr (todos los símbolos"
+            f"{f', {_WS._SCAN_WINDOW_S:g}s cada {_WS._SCAN_SECS:g}s' if _WS._PERIODIC_SCAN else ''}) "
+            f"+ {_WS._RADAR_STREAM} para el radar (≥{MIN_GAIN_FILTER:.0f}% o posición abierta)"
         )
 
     def _start_kline_cache(self, symbols: List[str]) -> None:
-        """Arranca UNA vez el stream de velas (una conexión por intervalo) para
-        todos los símbolos. Los que entren después al radar se añaden con
-        ensure_symbols()."""
+        """Arranca UNA vez el stream de velas (una conexión por intervalo). Los
+        símbolos que entren después al radar se añaden con ensure_symbols() y, sin
+        KLINE_ALL_SYMBOLS, los que salen se dan de baja con drop_symbols()."""
         self._stop_kline_cache()
         self.kline_cache = KlineWebSocketStream(
             symbols, intervals=KLINE_INTERVALS, history=KLINE_HISTORY, dtype=KLINE_DTYPE,
         )
         self.kline_cache.start()
-        self.log(f"Velas por WebSocket ({', '.join(KLINE_INTERVALS)}): {len(symbols)} símbolos, "
+        scope = "todos los perpetuos" if KLINE_ALL_SYMBOLS else "solo radar y posiciones"
+        self.log(f"Velas por WebSocket ({', '.join(KLINE_INTERVALS)}, {scope}): {len(symbols)} símbolos, "
                  f"{KLINE_HISTORY} velas cerradas por símbolo, {KLINE_DTYPE} (sin REST)")
 
     # ── Símbolos operables (caché en disco + REST) ────────────────────────────
@@ -1119,7 +1132,7 @@ class TradingBot:
                 self._log_throttled("watch_add", f"No pude suscribir {symbol}: {exc}")
         kc = self.kline_cache
         if kc is not None:
-            kc.ensure_symbols([symbol])         # no-op si ya estaba (normalmente sí)
+            kc.ensure_symbols([symbol])         # suscribe sus velas (no-op si ya estaba)
         self.log(f"RADAR + {symbol} ({len(self.watch)} vigilados)")
 
     def _prune_watch(self) -> None:
@@ -1147,6 +1160,9 @@ class TradingBot:
             pc.update_symbols(sorted(keep | pos_syms))
         except Exception as exc:
             self.last_error = str(exc)
+        kc = self.kline_cache
+        if kc is not None and not KLINE_ALL_SYMBOLS:
+            kc.drop_symbols([s for s in dropped if s not in pos_syms])
         self.log(f"RADAR - {len(dropped)} fuera ({', '.join(sorted(dropped)[:6])}"
                  f"{'…' if len(dropped) > 6 else ''}) → {len(self.watch)} vigilados")
 
@@ -2434,6 +2450,23 @@ if os.getenv("BOT_AUTOSTART", "true").lower() == "true":    # false = solo para 
 app = Flask(__name__)
 
 
+@app.after_request
+def _gzip_json(resp):
+    """Comprime las respuestas JSON grandes (/api/status, /api/trades…): Render
+    cobra como ancho de banda de salida todo lo que se manda al navegador."""
+    if (resp.status_code != 200 or resp.direct_passthrough or resp.mimetype != "application/json"
+            or request.accept_encodings.quality("gzip") <= 0
+            or "Content-Encoding" in resp.headers):
+        return resp
+    data = resp.get_data()
+    if len(data) < 1024:
+        return resp
+    resp.set_data(gzip.compress(data, compresslevel=5))
+    resp.headers["Content-Encoding"] = "gzip"
+    resp.headers["Vary"] = "Accept-Encoding"
+    return resp
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HTML + JS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2911,7 +2944,7 @@ function fmtDur(secs) {
 let pollCount = 0, livePollCount = 0, _cdData = {}, _lastFetch = 0, _prevScan = 0;
 let _entryLevels = [50], _posSyms = new Set(), _winSyms = new Set();
 let _posSig = '', _winSig = '', _persisted = false;
-let livePollMs = 250, statusPollMs = 1500;
+let livePollMs = 2000, statusPollMs = 4000;
 
 function tickTimers() {
   const elapsed = (Date.now() - _lastFetch) / 1000;
@@ -3204,7 +3237,7 @@ async function loadStats() {
     const resp = await fetch('/api/stats', { cache: 'no-store' });
     if (resp.ok) renderStats(await resp.json());
   } catch (e) { /* silencioso */ }
-  finally { clearTimeout(statsTimer); statsTimer = setTimeout(loadStats, 15000); }
+  finally { clearTimeout(statsTimer); statsTimer = document.hidden ? null : setTimeout(loadStats, 15000); }
 }
 
 // ── SL global ───────────────────────────────────────────────────────────────
@@ -3452,12 +3485,12 @@ async function livePoll() {
   } finally {
     const spent = performance.now() - t0;
     const backoff = liveFails ? Math.min(3000, liveFails * 300) : 0;
-    liveTimer = setTimeout(livePoll, Math.max(0, livePollMs - spent) + backoff);
+    liveTimer = document.hidden ? null : setTimeout(livePoll, Math.max(0, livePollMs - spent) + backoff);
   }
 }
 
 // ── Bucle 2: estructura completa ────────────────────────────────────────────
-let statusTimer = null, statusDelay = 1500, statusFailing = false, statusInFlight = false, _lastFull = 0;
+let statusTimer = null, statusDelay = 4000, statusFailing = false, statusInFlight = false, _lastFull = 0;
 async function pollStatus() {
   if (statusInFlight) return;
   statusInFlight = true; _lastFull = Date.now();
@@ -3475,7 +3508,7 @@ async function pollStatus() {
     statusDelay = Math.min(statusDelay * 1.5, 15000);
   } finally {
     statusInFlight = false;
-    statusTimer = setTimeout(pollStatus, statusDelay);
+    statusTimer = document.hidden ? null : setTimeout(pollStatus, statusDelay);
   }
 }
 function requestFull(force) {
@@ -3488,6 +3521,17 @@ function requestFull(force) {
 livePoll();
 pollStatus();
 loadStats();
+// Pestaña oculta o minimizada = sin consultas (cada respuesta cuesta ancho de banda en Render)
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    [liveTimer, statusTimer, statsTimer].forEach(t => t && clearTimeout(t));
+    liveTimer = statusTimer = statsTimer = null;
+  } else {
+    if (!liveTimer) livePoll();
+    requestFull(true);
+    loadStats();
+  }
+});
 window.addEventListener('beforeunload', () => {
   [liveTimer, statusTimer, statsTimer].forEach(t => t && clearTimeout(t));
 });

@@ -48,7 +48,11 @@ services:
 
       # ── Velas solo por WebSocket (una conexión por intervalo) ───────────────
       - key: KLINE_INTERVALS
-        value: "1m"           # ej. "1m,5m,15m": cada intervalo = 1 conexión con todos los símbolos
+        value: "1m"           # ej. "1m,5m,15m": cada intervalo = 1 conexión (radar y posiciones)
+      - key: WS_TICKER_SCAN_SECS
+        value: "300"          # búsqueda de símbolos en todo el mercado cada 5 min (0 = siempre abierta)
+      - key: KLINE_ALL_SYMBOLS
+        value: "false"        # "true" = velas de TODOS los símbolos (decenas de MB/hora de ancho de banda)
       - key: KLINE_HISTORY
         value: "2"            # velas cerradas por símbolo (última y penúltima)
       - key: KLINE_DTYPE
