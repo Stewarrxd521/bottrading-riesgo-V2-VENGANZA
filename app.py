@@ -19,6 +19,7 @@ from math import floor
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from flask import Flask, jsonify, make_response, render_template_string, request
@@ -285,6 +286,7 @@ REVENGE_RECOVER_PCT = float(os.getenv("REVENGE_RECOVER_PCT", "50"))
 REVENGE_SL_USD      = float(os.getenv("REVENGE_SL_USD", "-4"))
 
 # ── Executor externo ──────────────────────────────────────────────────────────
+# La URL se puede cambiar en caliente desde la web (tarjeta "Executor"); vacía = sin señales.
 EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 
@@ -310,10 +312,21 @@ SHUTDOWN_DRAIN_S  = 5.0     # al apagar: espera a que terminen las órdenes en v
 UI_SETTINGS: Dict[str, Any] = {}
 
 
+def normalize_executor_url(url: Any) -> Optional[str]:
+    """URL del executor limpia ("" = desactivado) o None si no es http(s) válida."""
+    url = str(url or "").strip().rstrip("/")
+    if not url:
+        return ""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc or " " in url:
+        return None
+    return url
+
+
 def _apply_settings(data: dict) -> None:
     """Aplica ajustes guardados (los inválidos se ignoran) y los marca como de la web."""
     global DEFAULT_STOP_LOSS_USD, TAKE_PROFIT_FRACTION, TP_OVERRIDES
-    global REVENGE_ENABLED, REVENGE_MULT, REVENGE_RECOVER_PCT, REVENGE_SL_USD
+    global REVENGE_ENABLED, REVENGE_MULT, REVENGE_RECOVER_PCT, REVENGE_SL_USD, EXECUTOR_URL
     if not isinstance(data, dict):
         return
     for key, val in data.items():
@@ -349,6 +362,11 @@ def _apply_settings(data: dict) -> None:
                 if val >= 0:
                     continue
                 REVENGE_SL_USD = val
+            elif key == "executor_url":
+                val = normalize_executor_url(val)
+                if val is None:
+                    continue
+                EXECUTOR_URL = val
             else:
                 continue
         except (TypeError, ValueError, AttributeError):
@@ -1829,6 +1847,28 @@ class TradingBot:
         return {"enabled": REVENGE_ENABLED, "mult": REVENGE_MULT,
                 "recover_pct": REVENGE_RECOVER_PCT, "sl_usd": REVENGE_SL_USD}
 
+    def set_executor_url(self, url: str) -> str:
+        """Cambia en caliente adónde se mandan las señales (vacía = desactivado)."""
+        _apply_settings({"executor_url": url})
+        self.executor.config.executor_url = EXECUTOR_URL
+        self._save_settings()
+        self.log(f"[executor] URL → {EXECUTOR_URL}" if EXECUTOR_URL
+                 else "[executor] URL vacía — señales desactivadas")
+        self.persist_state()
+        return EXECUTOR_URL
+
+    def test_executor(self) -> dict:
+        """Consulta /api/state del executor configurado (para el botón Probar)."""
+        url = self.executor.config.executor_url
+        if not url:
+            return {"ok": False, "error": "No hay URL configurada"}
+        t0 = time.time()
+        state = self.executor.fetch_state_sync()
+        ms = round((time.time() - t0) * 1000)
+        if state is None:
+            return {"ok": False, "error": f"Sin respuesta válida de {url}/api/state", "ms": ms}
+        return {"ok": True, "ms": ms}
+
     def set_take_profit(self, symbol: str, tp_usd: Optional[float]) -> bool:
         """TP MANUAL (USD, positivo) de una posición abierta; None = volver al automático
         (en una venganza, al TP de recuperación con el que se abrió)."""
@@ -2124,7 +2164,7 @@ class TradingBot:
             "total_unrealized":   total_unreal,
             "total_realized_pnl": total_realized_pnl,
             "total_notional":    total_notional,
-            "executor_url":      EXECUTOR_URL or "",
+            "executor_url":      self.executor.config.executor_url or "",
             "positions":         open_positions,
             "winners":           winners_out,
             "closed_trades":     closed,
@@ -2293,6 +2333,7 @@ class TradingBot:
         if "default_stop_loss_usd" in doc:
             _apply_settings({"default_stop_loss_usd": doc.get("default_stop_loss_usd")})
         _apply_settings(doc.get("settings") or {})
+        self.executor.config.executor_url = EXECUTOR_URL
 
         positions: Dict[str, BotPosition] = {}
         for sym, d in (doc.get("positions") or {}).items():
@@ -2556,6 +2597,7 @@ HTML = r"""<!doctype html>
     .slcard { border-color: rgba(251,146,60,.45); }
     .tpcard { border-color: rgba(52,211,153,.4); }
     .rvcard { border-color: rgba(167,139,250,.45); }
+    .excard { border-color: rgba(45,212,191,.4); }
     .rvcard.on { box-shadow: 0 0 0 1px rgba(167,139,250,.5), 0 0 18px rgba(167,139,250,.18); }
     .slrow { display: flex; gap: 8px; align-items: center; }
     .slrow input { padding: 9px 10px; font-size: 15px; }
@@ -2783,6 +2825,25 @@ HTML = r"""<!doctype html>
         <div id="rvMsg" class="msg" style="margin:0"></div>
         <p class="note" id="rvNote">Tras un SL abre un LONG en el mismo símbolo.</p>
       </article>
+
+      <article id="sec-exec" class="card cfg excard">
+        <div class="cfg-top">
+          <span class="cfg-title">🔗 Executor</span>
+          <span id="exState" class="tag" style="color:var(--teal);border-color:var(--teal)">—</span>
+        </div>
+        <div class="kv"><span>Envía las órdenes a</span></div>
+        <b id="exCurrent" style="font-size:13px;word-break:break-all;color:var(--teal)">—</b>
+        <div class="slrow">
+          <input id="exInput" type="url" inputmode="url" placeholder="https://mi-executor.onrender.com" aria-label="Nueva URL del executor"
+                 style="width:100%;background:#0b1226;color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:9px 10px;font-size:14px;outline:none">
+          <button id="exSave" class="btn btn-orange">Aplicar</button>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button id="exTest" class="btn btn-ghost btn-sm">Probar conexión</button>
+        </div>
+        <div id="exMsg" class="msg" style="margin:0"></div>
+        <p class="note">Se aplica al instante a las próximas aperturas y cierres. Vacía = no se envían señales.</p>
+      </article>
     </div>
   </section>
 
@@ -2988,6 +3049,10 @@ function render(d) {
   if (gi && document.activeElement !== gi && !gi.dataset.dirty) gi.value = defSl;
   renderTpConfig(d.tp_config);
   renderRevenge(d.revenge, defSl);
+  setTxt('exCurrent', d.executor_url || 'sin configurar');
+  setTxt('exState', d.executor_url ? 'activo' : 'off');
+  const ei = q('exInput');
+  if (ei && document.activeElement !== ei && !ei.dataset.dirty) ei.value = d.executor_url || '';
 
   const pu = n(d.total_unrealized);
   q('pnl').textContent = sgn(pu); q('pnl').className = 'value ' + cls(pu);
@@ -3415,6 +3480,45 @@ async function setRevenge(body) {
   }
 }
 
+// ── Executor ────────────────────────────────────────────────────────────────
+async function saveExecutor() {
+  const msg = q('exMsg'), btn = q('exSave');
+  const url = String(q('exInput').value || '').trim();
+  if (url && !/^https?:\/\/\S+$/i.test(url)) {
+    msg.className = 'msg negative'; msg.textContent = 'La URL debe empezar por http:// o https://'; return;
+  }
+  if (!url && !confirm('¿Dejar la URL vacía? El bot dejará de enviar órdenes al executor.')) return;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const resp = await fetch('/api/set-executor', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+      body: JSON.stringify({ url }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      delete q('exInput').dataset.dirty;
+      msg.className = 'msg positive';
+      msg.textContent = data.executor_url ? `✓ Órdenes a ${data.executor_url}` : '✓ Señales desactivadas';
+      requestFull(true);
+    } else { msg.className = 'msg negative'; msg.textContent = data.error || `Error HTTP ${resp.status}`; }
+  } catch (err) {
+    msg.className = 'msg negative'; msg.textContent = 'Error de red: ' + err.message;
+  } finally { btn.disabled = false; btn.textContent = 'Aplicar'; }
+}
+
+async function testExecutor() {
+  const msg = q('exMsg'), btn = q('exTest');
+  btn.disabled = true; msg.className = 'msg'; msg.textContent = 'Probando…';
+  try {
+    const resp = await fetch('/api/test-executor', { method: 'POST', cache: 'no-store' });
+    const data = await resp.json();
+    msg.className = 'msg ' + (data.ok ? 'positive' : 'negative');
+    msg.textContent = data.ok ? `✓ Responde (${data.ms} ms)` : (data.error || `Error HTTP ${resp.status}`);
+  } catch (err) {
+    msg.className = 'msg negative'; msg.textContent = 'Error de red: ' + err.message;
+  } finally { btn.disabled = false; }
+}
+
 function editRevengeSl() {
   openNum({
     title: 'Venganza: Stop Loss',
@@ -3447,6 +3551,10 @@ document.addEventListener('DOMContentLoaded', () => {
   q('gslSave').addEventListener('click', saveGlobalSl);
   q('gslInput').addEventListener('input', () => { q('gslInput').dataset.dirty = '1'; });
   q('gslInput').addEventListener('keydown', e => { if (e.key === 'Enter') saveGlobalSl(); });
+  q('exSave').addEventListener('click', saveExecutor);
+  q('exTest').addEventListener('click', testExecutor);
+  q('exInput').addEventListener('input', () => { q('exInput').dataset.dirty = '1'; });
+  q('exInput').addEventListener('keydown', e => { if (e.key === 'Enter') saveExecutor(); });
   q('rvEnabled').addEventListener('change', async e => {
     e.target.dataset.busy = '1';
     await setRevenge({ enabled: e.target.checked });
@@ -3675,6 +3783,24 @@ def api_set_tp_config():
     if busy:
         return busy
     return jsonify({"ok": True, **bot.set_tp_settings(fraction, tranche, tranche_tp, clear)})
+
+
+@app.post("/api/set-executor")
+def api_set_executor():
+    """URL del executor en caliente: {"url": "https://..."}; "" desactiva las señales."""
+    data = request.get_json(silent=True) or {}
+    url = normalize_executor_url(data.get("url"))
+    if url is None:
+        return jsonify({"ok": False, "error": "URL inválida: debe empezar por http:// o https://"}), 400
+    busy = _not_owner_response()
+    if busy:
+        return busy
+    return jsonify({"ok": True, "executor_url": bot.set_executor_url(url)})
+
+
+@app.post("/api/test-executor")
+def api_test_executor():
+    return jsonify(bot.test_executor())
 
 
 @app.post("/api/set-revenge")

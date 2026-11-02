@@ -226,3 +226,18 @@ def test_gzip_respects_q0():
     c = app.app.test_client()
     r = c.get("/api/status", headers={"Accept-Encoding": "gzip;q=0, br"})
     assert r.headers.get("Content-Encoding") is None
+
+
+def test_executor_url_hot_swap(monkeypatch):
+    app.bot.store.writes_enabled = True
+    monkeypatch.setattr(app, "EXECUTOR_URL", "")
+    c = app.app.test_client()
+    r = c.post("/api/set-executor", json={"url": " https://nuevo-executor.onrender.com/ "})
+    assert r.get_json() == {"ok": True, "executor_url": "https://nuevo-executor.onrender.com"}
+    assert app.bot.executor.config.executor_url == "https://nuevo-executor.onrender.com"
+    assert app.UI_SETTINGS["executor_url"] == "https://nuevo-executor.onrender.com"
+    assert c.get("/api/status").get_json()["executor_url"] == "https://nuevo-executor.onrender.com"
+    assert c.post("/api/set-executor", json={"url": "ftp://x"}).status_code == 400
+    assert c.post("/api/set-executor", json={"url": ""}).get_json()["executor_url"] == ""
+    assert app.bot.executor.config.executor_url == ""
+    assert c.post("/api/test-executor").get_json()["ok"] is False
