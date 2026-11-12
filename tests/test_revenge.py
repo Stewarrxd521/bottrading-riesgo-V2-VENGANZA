@@ -30,7 +30,10 @@ def _settings(monkeypatch):
     monkeypatch.setattr(app, "REVENGE_ENABLED", True)
     monkeypatch.setattr(app, "REVENGE_MULT", 2.0)
     monkeypatch.setattr(app, "REVENGE_RECOVER_PCT", 50.0)
+    monkeypatch.setattr(app, "REVENGE_SL_PCT", 100.0)
+    monkeypatch.setattr(app, "REVENGE_DIRECTION", "opposite")
     monkeypatch.setattr(app, "REVENGE_SL_USD", -4.0)
+    monkeypatch.setattr(app, "REVENGE_SL_MODE", "pct")
     monkeypatch.setattr(app, "UI_SETTINGS", {})
 
 
@@ -62,7 +65,7 @@ def test_sl_opens_revenge_long():
     assert rev.side == "LONG" and rev.revenge and rev.revenge_of == 7
     assert rev.notional == pytest.approx(10.0)            # 5 × 2
     assert rev.target_usd() == pytest.approx(0.75)        # 50% de 1.5
-    assert rev.sl_usd == -4.0                             # SL propio de la venganza
+    assert rev.sl_usd == pytest.approx(-3.0)              # 100% de (1.5 × 2)
     assert rev.sl_mode == "venganza" and rev.tp_mode == "venganza"
     assert bot.closed_trades[0]["revenge"] is False
 
@@ -88,9 +91,21 @@ def test_revenge_sl_is_editable_and_applies_to_open_revenge():
     _short(bot)
     asyncio.run(_close(bot, 1.3, "SL"))
     bot.set_default_stop_loss(-20.0)
-    assert bot.positions[SYM].sl_usd == -4.0              # el SL global no la toca
-    bot.set_revenge_settings(sl_usd=-2.5)
+    assert bot.positions[SYM].sl_usd == pytest.approx(-3.0)   # el SL global no la toca
+    bot.set_revenge_settings(sl_pct=150)
+    assert bot.positions[SYM].sl_usd == pytest.approx(-4.5)   # 150% de (1.5 × 2)
+    bot.set_revenge_settings(sl_mode="usd", sl_usd=-2.5)        # SL fijo en USD
     assert bot.positions[SYM].sl_usd == -2.5
+    bot.set_revenge_settings(sl_mode="pct")
+    assert bot.positions[SYM].sl_usd == pytest.approx(-4.5)
+
+
+def test_fixed_usd_sl_mode_on_open(monkeypatch):
+    monkeypatch.setattr(app, "REVENGE_SL_MODE", "usd")
+    bot = _bot()
+    _short(bot)
+    asyncio.run(_close(bot, 1.3, "SL"))
+    assert bot.positions[SYM].sl_usd == -4.0
 
 
 def test_losing_revenge_does_not_chain():
@@ -103,12 +118,51 @@ def test_losing_revenge_does_not_chain():
     assert SYM not in bot.positions
 
 
-@pytest.mark.parametrize("reason,price", [("TP", 0.8), ("MANUAL", 1.3)])
-def test_only_sl_triggers_revenge(reason, price):
+def test_winning_close_does_not_trigger_revenge():
     bot = _bot()
     _short(bot)
-    asyncio.run(_close(bot, price, reason))
+    asyncio.run(_close(bot, 0.8, "TP"))
     assert SYM not in bot.positions
+
+
+def test_manual_losing_close_triggers_revenge():
+    bot = _bot()
+    _short(bot)
+    asyncio.run(_close(bot, 1.3, "MANUAL"))
+    assert bot.positions[SYM].revenge and bot.positions[SYM].side == "LONG"
+
+
+def test_bulk_close_does_not_trigger_revenge():
+    bot = _bot()
+    _short(bot)
+    asyncio.run(bot._close_position(SYM, 1.3, "MANUAL", allow_revenge=False))
+    assert SYM not in bot.positions
+
+
+def test_same_direction_and_custom_mult(monkeypatch):
+    monkeypatch.setattr(app, "REVENGE_DIRECTION", "same")
+    monkeypatch.setattr(app, "REVENGE_MULT", 11.0)
+    monkeypatch.setattr(app, "REVENGE_RECOVER_PCT", 64.0)
+    monkeypatch.setattr(app, "REVENGE_SL_PCT", 150.0)
+    bot = _bot()
+    _short(bot, qty=0.24 / 0.3, sl=-0.2)                  # pnl = -0.24 al subir a 1.3
+    asyncio.run(_close(bot, 1.3, "SL"))
+    rev = bot.positions[SYM]
+    assert rev.side == "SHORT" and rev.revenge
+    assert rev.notional == pytest.approx(55.0)
+    assert rev.target_usd() == pytest.approx(0.24 * 0.64)
+    assert rev.sl_usd == pytest.approx(-0.24 * 11 * 1.5)  # −3.96
+    assert rev.unrealized_pnl(rev.avg_entry * 0.9) > 0    # un short gana si baja
+    row_px = rev.avg_entry - 0.2 / rev.qty
+    assert asyncio.run(_close(bot, row_px, "TP"))
+    assert bot.closed_trades[0]["revenge"] and bot.closed_trades[0]["side"] == "SHORT"
+
+
+def test_revenge_side_helper(monkeypatch):
+    monkeypatch.setattr(app, "REVENGE_DIRECTION", "opposite")
+    assert app.revenge_side("SHORT") == "LONG" and app.revenge_side("LONG") == "SHORT"
+    monkeypatch.setattr(app, "REVENGE_DIRECTION", "same")
+    assert app.revenge_side("SHORT") == "SHORT"
 
 
 def test_disabled_revenge(monkeypatch):
@@ -160,22 +214,47 @@ def test_tp_config_rows():
 
 def test_settings_survive_recovery_doc():
     bot = _bot()
-    bot.set_revenge_settings(enabled=True, mult=2, recover_pct=100)
+    bot.set_revenge_settings(enabled=True, mult=11, recover_pct=100, sl_pct=150, direction="same",
+                             sl_mode="usd", sl_usd=-6)
     bot.set_tp_settings(tranche=2, tranche_tp=1.5)
     doc, _ = bot._recovery_doc()
     app.REVENGE_RECOVER_PCT, app.TP_OVERRIDES = 50.0, {}
+    app.REVENGE_MULT, app.REVENGE_SL_PCT, app.REVENGE_DIRECTION = 1.0, 100.0, "opposite"
     import json
     bot._apply_recovery(json.loads(json.dumps(doc)), [], "test")
     assert app.REVENGE_RECOVER_PCT == 100.0 and app.TP_OVERRIDES == {2: 1.5}
+    assert app.REVENGE_MULT == 11.0 and app.REVENGE_SL_PCT == 150.0 and app.REVENGE_DIRECTION == "same"
+    assert app.REVENGE_SL_MODE == "usd" and app.REVENGE_SL_USD == -6.0
+
+
+def test_revenge_position_survives_recovery():
+    bot = _bot()
+    _short(bot)
+    asyncio.run(_close(bot, 1.3, "SL"))
+    doc, _ = bot._recovery_doc()
+    import json
+    pos = bot._position_from_dict(json.loads(json.dumps(doc))["positions"][SYM])
+    assert pos.revenge and pos.revenge_base == pytest.approx(3.0)
+    pos.refresh_auto_sl()
+    assert pos.sl_usd == pytest.approx(-3.0)
 
 
 def test_api_routes():
     app.bot.store.writes_enabled = True
     c = app.app.test_client()
-    r = c.post("/api/set-revenge", json={"enabled": True, "mult": 2, "recover_pct": 120, "sl_usd": -3})
-    assert r.get_json() == {"ok": True, "enabled": True, "mult": 2.0, "recover_pct": 120.0, "sl_usd": -3.0}
-    assert c.post("/api/set-revenge", json={"recover_pct": -5}).status_code == 400
+    r = c.post("/api/set-revenge", json={"enabled": True, "mult": 11, "recover_pct": 120,
+                                         "sl_pct": 150, "direction": "same"})
+    assert r.get_json() == {"ok": True, "enabled": True, "mult": 11.0, "recover_pct": 120.0,
+                            "sl_pct": 150.0, "sl_usd": -4.0, "sl_mode": "pct", "direction": "same"}
+    r = c.post("/api/set-revenge", json={"sl_mode": "usd", "sl_usd": -3}).get_json()
+    assert r["sl_mode"] == "usd" and r["sl_usd"] == -3.0
     assert c.post("/api/set-revenge", json={"sl_usd": 2}).status_code == 400
+    assert c.post("/api/set-revenge", json={"sl_mode": "x"}).status_code == 400
+    assert c.post("/api/set-revenge", json={"recover_pct": -5}).status_code == 400
+    assert c.post("/api/set-revenge", json={"sl_pct": 0}).status_code == 400
+    assert c.post("/api/set-revenge", json={"mult": 500}).status_code == 400
+    assert c.post("/api/set-revenge", json={"direction": "arriba"}).status_code == 400
+    assert c.post("/api/set-revenge", json={"direction": "opposite"}).get_json()["direction"] == "opposite"
     assert c.post("/api/set-tp-config", json={"tranche": 1, "tp_usd": 0.9}).get_json()["ok"]
     assert c.post("/api/set-tp-config", json={"tranche": 99, "tp_usd": 1}).status_code == 400
     app.bot.positions[SYM] = app.BotPosition(symbol=SYM, fills=[
