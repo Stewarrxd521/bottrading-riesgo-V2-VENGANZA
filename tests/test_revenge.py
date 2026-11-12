@@ -32,6 +32,8 @@ def _settings(monkeypatch):
     monkeypatch.setattr(app, "REVENGE_RECOVER_PCT", 50.0)
     monkeypatch.setattr(app, "REVENGE_SL_PCT", 100.0)
     monkeypatch.setattr(app, "REVENGE_DIRECTION", "opposite")
+    monkeypatch.setattr(app, "REVENGE_SL_USD", -4.0)
+    monkeypatch.setattr(app, "REVENGE_SL_MODE", "pct")
     monkeypatch.setattr(app, "UI_SETTINGS", {})
 
 
@@ -92,6 +94,18 @@ def test_revenge_sl_is_editable_and_applies_to_open_revenge():
     assert bot.positions[SYM].sl_usd == pytest.approx(-3.0)   # el SL global no la toca
     bot.set_revenge_settings(sl_pct=150)
     assert bot.positions[SYM].sl_usd == pytest.approx(-4.5)   # 150% de (1.5 × 2)
+    bot.set_revenge_settings(sl_mode="usd", sl_usd=-2.5)        # SL fijo en USD
+    assert bot.positions[SYM].sl_usd == -2.5
+    bot.set_revenge_settings(sl_mode="pct")
+    assert bot.positions[SYM].sl_usd == pytest.approx(-4.5)
+
+
+def test_fixed_usd_sl_mode_on_open(monkeypatch):
+    monkeypatch.setattr(app, "REVENGE_SL_MODE", "usd")
+    bot = _bot()
+    _short(bot)
+    asyncio.run(_close(bot, 1.3, "SL"))
+    assert bot.positions[SYM].sl_usd == -4.0
 
 
 def test_losing_revenge_does_not_chain():
@@ -200,7 +214,8 @@ def test_tp_config_rows():
 
 def test_settings_survive_recovery_doc():
     bot = _bot()
-    bot.set_revenge_settings(enabled=True, mult=11, recover_pct=100, sl_pct=150, direction="same")
+    bot.set_revenge_settings(enabled=True, mult=11, recover_pct=100, sl_pct=150, direction="same",
+                             sl_mode="usd", sl_usd=-6)
     bot.set_tp_settings(tranche=2, tranche_tp=1.5)
     doc, _ = bot._recovery_doc()
     app.REVENGE_RECOVER_PCT, app.TP_OVERRIDES = 50.0, {}
@@ -209,6 +224,7 @@ def test_settings_survive_recovery_doc():
     bot._apply_recovery(json.loads(json.dumps(doc)), [], "test")
     assert app.REVENGE_RECOVER_PCT == 100.0 and app.TP_OVERRIDES == {2: 1.5}
     assert app.REVENGE_MULT == 11.0 and app.REVENGE_SL_PCT == 150.0 and app.REVENGE_DIRECTION == "same"
+    assert app.REVENGE_SL_MODE == "usd" and app.REVENGE_SL_USD == -6.0
 
 
 def test_revenge_position_survives_recovery():
@@ -229,7 +245,11 @@ def test_api_routes():
     r = c.post("/api/set-revenge", json={"enabled": True, "mult": 11, "recover_pct": 120,
                                          "sl_pct": 150, "direction": "same"})
     assert r.get_json() == {"ok": True, "enabled": True, "mult": 11.0, "recover_pct": 120.0,
-                            "sl_pct": 150.0, "direction": "same"}
+                            "sl_pct": 150.0, "sl_usd": -4.0, "sl_mode": "pct", "direction": "same"}
+    r = c.post("/api/set-revenge", json={"sl_mode": "usd", "sl_usd": -3}).get_json()
+    assert r["sl_mode"] == "usd" and r["sl_usd"] == -3.0
+    assert c.post("/api/set-revenge", json={"sl_usd": 2}).status_code == 400
+    assert c.post("/api/set-revenge", json={"sl_mode": "x"}).status_code == 400
     assert c.post("/api/set-revenge", json={"recover_pct": -5}).status_code == 400
     assert c.post("/api/set-revenge", json={"sl_pct": 0}).status_code == 400
     assert c.post("/api/set-revenge", json={"mult": 500}).status_code == 400
